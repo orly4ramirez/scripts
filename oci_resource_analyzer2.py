@@ -689,4 +689,80 @@ def scan_oci_resources(compartment_id, config_path, profile_name):
             all_resources['function_applications'].append(app_dict)
     except Exception as e:
         print(f"Error scanning functions (this may be expected if Functions service is not available): {e}")
-        all_
+    
+    return all_resources
+
+# Main execution
+if __name__ == "__main__":
+    print(f"Starting OCI resource scan for compartment {args.compartment_id}")
+    resources = scan_oci_resources(args.compartment_id, args.config, args.profile)
+    
+    # Debug - Data structure examination
+    print("\nDEBUG - Data structure examination:")
+    print(f"Resources is a {type(resources)}")
+    print(f"Resources has these keys: {list(resources.keys())}")
+
+    # Check first resource type with some data
+    for resource_type in resources.keys():
+        if isinstance(resources[resource_type], list) and resources[resource_type]:
+            print(f"\nExamining first {resource_type}:")
+            sample = resources[resource_type][0]
+            print(f"  Type: {type(sample)}")
+            
+            # Try different ways to access data
+            if hasattr(sample, '__dict__'):
+                print(f"  Has __dict__ with keys: {list(sample.__dict__.keys())[:5]}")
+            
+            # Try accessing common attributes directly
+            if hasattr(sample, 'id'):
+                print(f"  id: {sample.id}")
+            if hasattr(sample, 'name'):
+                print(f"  name: {sample.name}")
+            if hasattr(sample, 'display_name'):
+                print(f"  display_name: {sample.display_name}")
+            if hasattr(sample, 'compartment_id'):
+                print(f"  compartment_id: {sample.compartment_id}")
+            
+            # Look at raw representation
+            print(f"  String representation snippet: {str(sample)[:100]}...")
+            
+            # This is enough to understand the structure
+            break
+    
+    # Try to save the file with better serialization
+    try:
+        # Helper function to ensure data is JSON serializable
+        def sanitize_for_json(obj):
+            if isinstance(obj, dict):
+                return {str(k): sanitize_for_json(v) for k, v in obj.items() if k not in ['swagger_types', 'attribute_map']}
+            elif isinstance(obj, list):
+                return [sanitize_for_json(item) for item in obj]
+            elif isinstance(obj, (str, int, float, bool, type(None))):
+                return obj
+            else:
+                return str(obj)
+                
+        # Apply sanitization before saving
+        sanitized_resources = sanitize_for_json(resources)
+        
+        # Output the results
+        with open(args.output, 'w') as f:
+            json.dump(sanitized_resources, f, indent=2, cls=OciEncoder)
+        
+        print(f"Resource information saved to {args.output}")
+    except Exception as e:
+        print(f"Error saving to JSON: {e}")
+        # Fallback - save as string representation
+        with open(args.output, 'w') as f:
+            f.write(str(resources))
+        print(f"Saved resource information as string to {args.output} due to serialization error")
+    
+    # Print a summary
+    print("\nResource Summary:")
+    for resource_type, resources_list in resources.items():
+        if isinstance(resources_list, list):
+            print(f"  {resource_type}: {len(resources_list)}")
+        elif isinstance(resources_list, dict):
+            print(f"  {resource_type}: 1")
+    
+    print("\nUse this information to identify resources that might no longer be needed.")
