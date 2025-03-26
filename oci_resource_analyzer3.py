@@ -14,6 +14,7 @@ import time
 import json
 import csv
 import os
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Replace with your actual tenancy ID
@@ -28,6 +29,7 @@ RESOURCE_GROUPS = {
     "security": "Security Resources",
     "management": "Management Resources",
     "integration": "Integration Resources",
+    "vbs": "DevOps Build Resources",  # Added VBS group
     "all": "All Resources"
 }
 
@@ -68,6 +70,7 @@ RESOURCE_TYPES = [
     # Security Group
     ('vaults', 'Vaults', 'security'),
     ('secrets', 'Secrets', 'security'),
+    ('keys', 'Encryption Keys', 'security'),  # Added Keys resource type
     ('policies', 'Policies', 'security'),
     
     # Management Group
@@ -79,6 +82,13 @@ RESOURCE_TYPES = [
     # Integration Group
     ('integration_instances', 'Integration Cloud instances', 'integration'),
     ('api_gateways', 'API gateways', 'integration'),
+    
+    # DevOps Build Resources (VBS)
+    ('build_pipelines', 'Build Pipelines', 'vbs'),
+    ('build_runs', 'Build Runs', 'vbs'),
+    ('repositories', 'Code Repositories', 'vbs'),
+    ('triggers', 'Build Triggers', 'vbs'),
+    ('artifacts', 'Build Artifacts', 'vbs'),
 ]
 
 # Attributes that commonly reference other resources
@@ -108,6 +118,32 @@ REFERENCE_ATTRIBUTES = [
     'dhcp_options_id',
     'dns_resolver_id'
 ]
+
+# Logger class to capture console output to a file
+class Logger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w")
+        
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+        
+    def close(self):
+        self.log.close()
+
+def init_logger(output_dir):
+    """Initialize the logger to capture console output to a file."""
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
+    log_file = os.path.join(output_dir, "summary_log.txt")
+    sys.stdout = Logger(log_file)
+    return log_file
 
 def print_available_resource_types():
     """Print all available resource types that can be scanned."""
@@ -676,9 +712,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
         elif resource_type == 'public_ips':
             client = oci.core.VirtualNetworkClient(config)
             
-            # Get public IPs in the region
+            # Get public IPs in the region - FIXED: use named parameters
             public_ips = oci.pagination.list_call_get_all_results(
-                client.list_public_ips, compartment_id, scope="REGION"
+                client.list_public_ips,
+                compartment_id=compartment_id,
+                scope="REGION"
             ).data
             
             for public_ip in public_ips:
@@ -692,7 +730,9 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             
             for ad in ads:
                 ad_public_ips = oci.pagination.list_call_get_all_results(
-                    client.list_public_ips, compartment_id, scope="AVAILABILITY_DOMAIN", 
+                    client.list_public_ips,
+                    compartment_id=compartment_id,
+                    scope="AVAILABILITY_DOMAIN", 
                     availability_domain=ad.name
                 ).data
                 
@@ -1067,6 +1107,71 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             except Exception as e:
                 print(f"Error: {str(e)}")
                 
+        elif resource_type == 'keys':
+            try:
+                # KMS client for key management
+                client = oci.key_management.KmsManagementClient(config)
+                
+                # First, get all vaults
+                vault_client = oci.key_management.KmsVaultClient(config)
+                vaults = oci.pagination.list_call_get_all_results(
+                    vault_client.list_vaults,
+                    compartment_id=compartment_id
+                ).data
+                
+                for vault in vaults:
+                    # For each vault, we need to create a specific client with the vault's management endpoint
+                    try:
+                        # Get vault details to get management endpoint
+                        vault_details = vault_client.get_vault(vault.id).data
+                        
+                        # Only proceed if vault is active
+                        if vault_details.lifecycle_state != "ACTIVE":
+                            continue
+                            
+                        # Create a new config with the vault's management endpoint
+                        vault_config = config.copy()
+                        vault_config['service_endpoint'] = vault_details.management_endpoint
+                        
+                        # Create a client with the vault endpoint
+                        kms_client = oci.key_management.KmsManagementClient(vault_config)
+                        
+                        # List keys in this vault
+                        vault_keys = oci.pagination.list_call_get_all_results(
+                            kms_client.list_keys,
+                            compartment_id=compartment_id
+                        ).data
+                        
+                        for key in vault_keys:
+                            resource_details = extract_resource_details(key, compartments)
+                            # Add vault information
+                            resource_details['vault_id'] = vault.id
+                            resource_details['vault_name'] = vault.display_name
+                            
+                            # Get key versions if available
+                            try:
+                                key_versions = oci.pagination.list_call_get_all_results(
+                                    kms_client.list_key_versions,
+                                    key_id=key.id
+                                ).data
+                                resource_details['version_count'] = len(key_versions)
+                                if key_versions:
+                                    resource_details['latest_version'] = key_versions[0].id
+                            except Exception as e:
+                                # Skip version info if can't access
+                                pass
+                                
+                            resources.append(resource_details)
+                    except Exception as ve:
+                        print(f"Warning: Could not access vault {vault.display_name}: {str(ve)}")
+                
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error scanning keys: {str(e)}")
+                
         elif resource_type == 'policies':
             client = oci.identity.IdentityClient(config)
             policies = oci.pagination.list_call_get_all_results(
@@ -1200,6 +1305,140 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     # Method not available in this version
                     print("SFTP transfer methods not available")
                 
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                
+        # New DevOps/VBS Resource Types
+        elif resource_type == 'build_pipelines':
+            try:
+                client = oci.devops.DevopsClient(config)
+                pipelines = oci.pagination.list_call_get_all_results(
+                    client.list_build_pipelines,
+                    compartment_id=compartment_id
+                ).data
+                
+                for pipeline in pipelines:
+                    resource_details = extract_resource_details(pipeline, compartments)
+                    
+                    # Get build pipeline stages if possible
+                    try:
+                        stages = oci.pagination.list_call_get_all_results(
+                            client.list_build_pipeline_stages,
+                            build_pipeline_id=pipeline.id
+                        ).data
+                        resource_details['stage_count'] = len(stages)
+                    except Exception as e:
+                        pass
+                    
+                    resources.append(resource_details)
+                    
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+
+        elif resource_type == 'build_runs':
+            try:
+                client = oci.devops.DevopsClient(config)
+                runs = oci.pagination.list_call_get_all_results(
+                    client.list_build_runs,
+                    compartment_id=compartment_id
+                ).data
+                
+                for run in runs:
+                    resource_details = extract_resource_details(run, compartments)
+                    
+                    # Add pipeline information if available
+                    if hasattr(run, 'build_pipeline_id'):
+                        try:
+                            pipeline = client.get_build_pipeline(run.build_pipeline_id).data
+                            resource_details['pipeline_name'] = pipeline.display_name
+                        except:
+                            pass
+                    
+                    resources.append(resource_details)
+                    
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+
+        elif resource_type == 'repositories':
+            try:
+                client = oci.devops.DevopsClient(config)
+                repos = oci.pagination.list_call_get_all_results(
+                    client.list_repositories,
+                    compartment_id=compartment_id
+                ).data
+                
+                for repo in repos:
+                    resource_details = extract_resource_details(repo, compartments)
+                    
+                    # Add project information if available
+                    if hasattr(repo, 'project_id'):
+                        try:
+                            project = client.get_project(repo.project_id).data
+                            resource_details['project_name'] = project.name
+                        except:
+                            pass
+                    
+                    resources.append(resource_details)
+                    
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+
+        elif resource_type == 'triggers':
+            try:
+                client = oci.devops.DevopsClient(config)
+                triggers = oci.pagination.list_call_get_all_results(
+                    client.list_triggers,
+                    compartment_id=compartment_id
+                ).data
+                
+                for trigger in triggers:
+                    resource_details = extract_resource_details(trigger, compartments)
+                    
+                    # Add project information if available
+                    if hasattr(trigger, 'project_id'):
+                        try:
+                            project = client.get_project(trigger.project_id).data
+                            resource_details['project_name'] = project.name
+                        except:
+                            pass
+                    
+                    resources.append(resource_details)
+                    
+                if resources:
+                    print(f"Found {len(resources)} {resource_display}")
+                else:
+                    print(f"No {resource_display} found")
+            except Exception as e:
+                print(f"Error: {str(e)}")
+
+        elif resource_type == 'artifacts':
+            try:
+                client = oci.artifacts.ArtifactsClient(config)
+                artifacts = oci.pagination.list_call_get_all_results(
+                    client.list_artifacts,
+                    compartment_id=compartment_id
+                ).data
+                
+                for artifact in artifacts:
+                    resource_details = extract_resource_details(artifact, compartments)
+                    resources.append(resource_details)
+                    
                 if resources:
                     print(f"Found {len(resources)} {resource_display}")
                 else:
@@ -1577,6 +1816,18 @@ def main():
         print_available_resource_groups()
         sys.exit(0)
     
+    # Determine default output directory
+    if not args.output:
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = f"oci_resources_{timestamp}"
+    else:
+        output_dir = args.output
+        
+    # Initialize the logger to capture console output
+    if args.output_format in ['json', 'csv']:
+        log_file = init_logger(output_dir)
+        print(f"Capturing console output to {log_file}")
+    
     # Load OCI config
     try:
         config = oci.config.from_file(args.config, args.profile)
@@ -1638,6 +1889,13 @@ def main():
         save_to_csv(results, compartment_info, args.output)
     
     print("\nTo see detailed resource information, use --output-format json or csv")
+    
+    # Reset stdout if we were logging
+    if args.output_format in ['json', 'csv'] and isinstance(sys.stdout, Logger):
+        sys.stdout.close()
+        sys.stdout = sys.__stdout__
+        print(f"Analysis complete. Results saved to {args.output}")
+        print(f"Console output captured in {log_file}")
 
 if __name__ == "__main__":
     main()
