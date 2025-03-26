@@ -16,6 +16,9 @@ import csv
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Replace with your actual tenancy ID
+TENANCY_ID = "ocid1.tenancy.oc1..aaaaaaaxxxxxxxx"  # <-- REPLACE THIS WITH YOUR TENANCY OCID
+
 # Resource types to check
 RESOURCE_TYPES = [
     # Compute
@@ -76,54 +79,120 @@ REFERENCE_ATTRIBUTES = [
     'gateway_id'
 ]
 
-def get_compartment_id_by_name(identity_client, compartment_name, parent_compartment_id=None):
+def list_all_compartments(identity_client):
+    """
+    List all compartments in the tenancy with their names and IDs.
+    Helps with debugging compartment name issues.
+    """
+    try:
+        print("\nFetching all compartments in tenancy...")
+        compartments = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            TENANCY_ID,
+            compartment_id_in_subtree=True,
+            access_level="ACCESSIBLE"
+        ).data
+        
+        # Get the root compartment (tenancy) as well
+        try:
+            tenancy = identity_client.get_compartment(TENANCY_ID).data
+            compartments.append(tenancy)
+        except Exception as e:
+            print(f"Could not get tenancy details: {e}")
+        
+        # Sort compartments by name
+        compartments.sort(key=lambda c: c.name.lower())
+        
+        print("\nAvailable compartments:")
+        print("-" * 80)
+        print(f"{'Compartment Name':<50} {'Compartment ID':<30} {'Status':<15}")
+        print("-" * 80)
+        
+        for comp in compartments:
+            print(f"{comp.name:<50} {comp.id:<30} {comp.lifecycle_state:<15}")
+        
+        return compartments
+    except Exception as e:
+        print(f"Error listing compartments: {e}")
+        return []
+
+def get_compartment_id_by_name(identity_client, compartment_name, parent_compartment_id=None, list_all=False):
     """
     Find a compartment ID by its name.
     Searches in the given parent compartment or tenancy root if no parent specified.
+    
+    Args:
+        identity_client: OCI Identity client
+        compartment_name: Name of compartment to find
+        parent_compartment_id: ID of parent compartment to search in (optional)
+        list_all: Whether to list all compartments for debugging (optional)
+        
+    Returns:
+        str: Compartment OCID or None if not found
     """
     if parent_compartment_id is None:
-        # Get tenancy ID as root compartment
-        parent_compartment_id = identity_client.get_tenancy(identity_client.tenancy_id).data.id
+        parent_compartment_id = TENANCY_ID
     
-    # List all compartments in the parent
-    compartments = []
-    try:
-        compartments = oci.pagination.list_call_get_all_results(
-            identity_client.list_compartments,
-            parent_compartment_id,
-            compartment_id_in_subtree=True,
-            access_level="ACCESSIBLE",
-            lifecycle_state="ACTIVE"
-        ).data
-    except Exception as e:
-        print(f"Error listing compartments: {e}")
-        return None
+    print(f"Searching for compartment: '{compartment_name}'")
     
-    # Look for an exact match first
-    for compartment in compartments:
-        if compartment.name.lower() == compartment_name.lower():
-            return compartment.id
+    # List all compartments if requested or if debugging
+    if list_all:
+        all_compartments = list_all_compartments(identity_client)
+    else:
+        try:
+            # Get all compartments
+            all_compartments = oci.pagination.list_call_get_all_results(
+                identity_client.list_compartments,
+                parent_compartment_id,
+                compartment_id_in_subtree=True,
+                access_level="ACCESSIBLE"
+            ).data
+            
+            # Add the tenancy as a possible compartment
+            try:
+                tenancy = identity_client.get_compartment(TENANCY_ID).data
+                all_compartments.append(tenancy)
+            except Exception as e:
+                print(f"Could not get tenancy details: {e}")
+                
+        except Exception as e:
+            print(f"Error listing compartments: {e}")
+            return None
+    
+    # First, try to find an exact match (case-insensitive)
+    exact_matches = [c for c in all_compartments if c.name.lower() == compartment_name.lower()]
+    if exact_matches:
+        match = exact_matches[0]
+        print(f"Found exact match: {match.name} (ID: {match.id})")
+        return match.id
     
     # If no exact match, look for partial matches
-    matches = [c for c in compartments if compartment_name.lower() in c.name.lower()]
+    partial_matches = [c for c in all_compartments if compartment_name.lower() in c.name.lower()]
     
-    if not matches:
+    if not partial_matches:
         print(f"No compartment found with name '{compartment_name}'")
+        print("Use the --list-compartments option to see all available compartments")
         return None
     
-    if len(matches) == 1:
-        return matches[0].id
+    if len(partial_matches) == 1:
+        match = partial_matches[0]
+        print(f"Found partial match: {match.name} (ID: {match.id})")
+        return match.id
     
     # If multiple matches, let user choose
     print(f"Multiple compartments found matching '{compartment_name}':")
-    for i, comp in enumerate(matches):
-        print(f"[{i+1}] {comp.name} (ID: {comp.id})")
+    for i, comp in enumerate(partial_matches):
+        print(f"[{i+1}] {comp.name} (ID: {comp.id}, State: {comp.lifecycle_state})")
     
-    choice = input("Enter the number of the compartment to use: ")
+    choice = input("Enter the number of the compartment to use (or 'q' to quit): ")
+    if choice.lower() == 'q':
+        print("Exiting as requested.")
+        sys.exit(0)
+        
     try:
         index = int(choice) - 1
-        if 0 <= index < len(matches):
-            return matches[index].id
+        if 0 <= index < len(partial_matches):
+            return partial_matches[index].id
         else:
             print("Invalid choice. Please run the script again.")
             return None
@@ -141,8 +210,8 @@ def get_all_compartments(identity_client):
     compartments = {}
     
     try:
-        # Get tenancy ID
-        tenancy_id = identity_client.get_tenancy(identity_client.tenancy_id).data.id
+        # Use the hardcoded tenancy ID
+        tenancy_id = TENANCY_ID
         
         # Get the tenancy (root compartment)
         tenancy = identity_client.get_compartment(tenancy_id).data
@@ -623,8 +692,8 @@ def scan_resources(config, compartment_id):
         print("Using instance principals authentication")
     except:
         # Fall back to config file
-        client_factory = oci.config.from_file(config_file=config)
         print("Using config file authentication")
+        client_factory = config
     
     # Get all compartments for cross-reference lookup
     identity_client = oci.identity.IdentityClient(config)
@@ -847,6 +916,8 @@ def main():
     parser.add_argument('--output-format', choices=['json', 'csv', 'console'], default='console', 
                         help='Output format (default: console)')
     parser.add_argument('--output', help='Output file for JSON or directory for CSV')
+    parser.add_argument('--list-compartments', action='store_true', 
+                        help='List all available compartments before scanning')
     
     args = parser.parse_args()
     
@@ -861,9 +932,18 @@ def main():
     # Create identity client
     identity_client = oci.identity.IdentityClient(config)
     
+    # List all compartments if requested
+    if args.list_compartments:
+        list_all_compartments(identity_client)
+        
     # Get compartment ID from name
-    compartment_id = get_compartment_id_by_name(identity_client, args.compartment)
+    compartment_id = get_compartment_id_by_name(identity_client, args.compartment, list_all=args.list_compartments)
     if not compartment_id:
+        print("\nTips for finding your compartment:")
+        print("1. Use the --list-compartments option to see all available compartments")
+        print("2. Check for case sensitivity issues in the compartment name")
+        print("3. Verify the compartment name in the OCI console")
+        print("4. Make sure your OCI config has permission to access the compartment")
         sys.exit(1)
     
     # Get compartment details
