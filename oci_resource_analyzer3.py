@@ -325,6 +325,14 @@ def find_cross_compartment_references(resources_by_type, target_compartment_id, 
                     'compartment_id': resource.get('compartment_id')
                 }
     
+    # Track unique compartments involved
+    referenced_from_compartments = set()
+    references_to_compartments = set()
+    
+    # Count references
+    total_inbound = 0
+    total_outbound = 0
+    
     # Now check for references between resources
     for resource_type, info in resources_by_type.items():
         for resource in info['resources']:
@@ -357,6 +365,8 @@ def find_cross_compartment_references(resources_by_type, target_compartment_id, 
                                     'reference_type': attr
                                 }
                                 resource.setdefault('references_to_compartments', []).append(reference_info)
+                                total_outbound += 1
+                                references_to_compartments.add(compartments[referenced_compartment_id].name)
                             
                             # Add inbound reference to the referenced resource
                             ref_details = referenced_resource['details']
@@ -369,6 +379,25 @@ def find_cross_compartment_references(resources_by_type, target_compartment_id, 
                                 'reference_type': attr
                             }
                             ref_details.setdefault('referenced_from_compartments', []).append(inbound_reference)
+                            total_inbound += 1
+                            referenced_from_compartments.add(compartments[resource_compartment_id].name)
+    
+    # Print summary of references found
+    if total_inbound > 0 or total_outbound > 0:
+        print(f"Found {total_inbound} inbound references from {len(referenced_from_compartments)} compartments")
+        print(f"Found {total_outbound} outbound references to {len(references_to_compartments)} compartments")
+        
+        if referenced_from_compartments:
+            print("Compartments referencing this compartment:")
+            for comp in sorted(referenced_from_compartments):
+                print(f"  - {comp}")
+                
+        if references_to_compartments:
+            print("Compartments referenced by this compartment:")
+            for comp in sorted(references_to_compartments):
+                print(f"  - {comp}")
+    else:
+        print("No cross-compartment references found")
     
     return resources_by_type
 
@@ -514,8 +543,10 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             
         elif resource_type == 'network_security_groups':
             client = oci.core.VirtualNetworkClient(config)
+            # Fixed - use named parameter
             nsgs = oci.pagination.list_call_get_all_results(
-                client.list_network_security_groups, compartment_id
+                client.list_network_security_groups,
+                compartment_id=compartment_id
             ).data
             for nsg in nsgs:
                 resource_details = extract_resource_details(nsg, compartments)
@@ -669,9 +700,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             
         elif resource_type == 'api_gateways':
             try:
+                # Try updated method
                 client = oci.apigateway.ApiGatewayClient(config)
                 gateways = oci.pagination.list_call_get_all_results(
-                    client.list_gateways, compartment_id
+                    client.list_api_gateways,  # Try the correct method name
+                    compartment_id=compartment_id
                 ).data
                 
                 for gateway in gateways:
@@ -738,7 +771,7 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 result_message = f"Error: {str(e)}"
             
         elif resource_type == 'sftp_servers':
-            # Try File Storage SFTP
+            # Use only File Storage SFTP since oci.transfer doesn't exist
             try:
                 client = oci.file_storage.FileStorageClient(config)
                 servers = oci.pagination.list_call_get_all_results(
@@ -763,29 +796,14 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     result_message = f"Found {len(resources)} {resource_display}"
                 else:
                     result_message = f"No {resource_display} found"
-            except:
-                # Try Transfer service
-                try:
-                    client = oci.transfer.TransferClient(config)
-                    servers = oci.pagination.list_call_get_all_results(
-                        client.list_transfer_servers, compartment_id
-                    ).data
-                    
-                    for server in servers:
-                        resources.append(extract_resource_details(server, compartments))
-                        
-                    if resources:
-                        result_message = f"Found {len(resources)} {resource_display}"
-                    else:
-                        result_message = f"No {resource_display} found"
-                except Exception as e:
-                    result_message = f"Error: {str(e)}"
+            except Exception as e:
+                result_message = f"Error: {str(e)}"
                 
     except Exception as e:
         result_message = f"Error: {str(e)}"
     
-    # Print scanning and result message on same line
-    print(f"Scanning {resource_display}... {result_message}")
+    # Print scanning and result message with better alignment
+    print(f"Scanning {resource_display}...".ljust(50) + result_message)
         
     return (resource_type, resource_display, resources)
 
@@ -838,6 +856,22 @@ def scan_resources(config, compartment_id, resource_type_filter=None):
     print(f"\nCompleted scan in {elapsed:.2f} seconds")
     
     return results
+
+def print_summary_counts(results):
+    """Print summary of all resources found."""
+    print("\nResource Count Summary:")
+    print("-" * 60)
+    print(f"{'Resource Type':<40} {'Count':>10}")
+    print("-" * 60)
+    
+    total_resources = 0
+    for resource_type, info in sorted(results.items(), key=lambda x: x[1]['display_name']):
+        count = info['count']
+        print(f"{info['display_name']:<40} {count:>10}")
+        total_resources += count
+    
+    print("-" * 60)
+    print(f"{'TOTAL RESOURCES':<40} {total_resources:>10}")
 
 def save_to_json(results, compartment_info, output_file):
     """Save results to a JSON file."""
@@ -979,13 +1013,52 @@ def save_to_csv(results, compartment_info, output_dir):
 
 def print_cross_compartment_summary(results, compartment_info):
     """Print a summary of cross-compartment references to the console."""
+    # Track which compartments are involved
+    referenced_from_compartments = set()
+    references_to_compartments = set()
+    total_inbound = 0
+    total_outbound = 0
+    
+    # First pass to count all references
+    for resource_type, info in results.items():
+        for resource in info['resources']:
+            if resource.get('referenced_from_compartments'):
+                for ref in resource.get('referenced_from_compartments', []):
+                    total_inbound += 1
+                    if 'compartment_name' in ref:
+                        referenced_from_compartments.add(ref['compartment_name'])
+            
+            if resource.get('references_to_compartments'):
+                for ref in resource.get('references_to_compartments', []):
+                    total_outbound += 1
+                    if 'compartment_name' in ref:
+                        references_to_compartments.add(ref['compartment_name'])
+    
     print("\nCross-Compartment Reference Summary:")
+    print("-" * 80)
+    
+    if total_inbound == 0 and total_outbound == 0:
+        print("No cross-compartment references found.")
+        return
+    
+    print(f"This compartment has {total_inbound} inbound references from {len(referenced_from_compartments)} compartment(s)")
+    print(f"This compartment has {total_outbound} outbound references to {len(references_to_compartments)} compartment(s)")
+    
+    if referenced_from_compartments:
+        print("\nCompartments referencing this compartment:")
+        for comp in sorted(referenced_from_compartments):
+            print(f"  - {comp}")
+    
+    if references_to_compartments:
+        print("\nCompartments referenced by this compartment:")
+        for comp in sorted(references_to_compartments):
+            print(f"  - {comp}")
+            
+    # Now show per-resource breakdown
+    print("\nResource-level Cross-Compartment References:")
     print("-" * 80)
     print(f"{'Resource Type':<25} {'Referenced From':<15} {'References To':<15}")
     print("-" * 80)
-    
-    total_inbound = 0
-    total_outbound = 0
     
     for resource_type, info in sorted(results.items(), key=lambda x: x[1]['display_name']):
         # Count cross-compartment references
@@ -1000,16 +1073,10 @@ def print_cross_compartment_summary(results, compartment_info):
         
         if refs_from > 0 or refs_to > 0:
             print(f"{info['display_name']:<25} {refs_from:<15} {refs_to:<15}")
-            total_inbound += refs_from
-            total_outbound += refs_to
     
     print("-" * 80)
     print(f"{'TOTAL':<25} {total_inbound:<15} {total_outbound:<15}")
-    
-    if total_inbound == 0 and total_outbound == 0:
-        print("\nNo cross-compartment references found.")
-    else:
-        print("\nUse --output-format json or csv for detailed reference information")
+    print("\nUse --output-format json or csv for detailed reference information")
 
 def main():
     # Parse command line arguments
@@ -1082,6 +1149,12 @@ def main():
     # Scan resources
     results = scan_resources(config, compartment_id, args.resource_type)
     
+    # Print summary counts
+    print_summary_counts(results)
+    
+    # Print cross-compartment summary
+    print_cross_compartment_summary(results, compartment_info)
+    
     # Determine default output file/directory if not specified
     if args.output_format in ['json', 'csv'] and not args.output:
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1096,21 +1169,6 @@ def main():
     elif args.output_format == 'csv':
         save_to_csv(results, compartment_info, args.output)
     else:
-        # Console output
-        print("\nResource summary:")
-        print("-" * 60)
-        print(f"{'Resource Type':<40} {'Count':>10}")
-        print("-" * 60)
-        
-        # Sort by count
-        sorted_results = sorted(results.items(), key=lambda x: x[1]['count'], reverse=True)
-        
-        for resource_type, info in sorted_results:
-            print(f"{info['display_name']:<40} {info['count']:>10}")
-        
-        # Print cross-compartment reference summary
-        print_cross_compartment_summary(results, compartment_info)
-        
         print("\nTo see detailed resource information, use --output-format json or csv")
 
 if __name__ == "__main__":
