@@ -79,6 +79,18 @@ REFERENCE_ATTRIBUTES = [
     'gateway_id'
 ]
 
+def print_available_resource_types():
+    """Print all available resource types that can be scanned."""
+    print("\nAvailable resource types:")
+    print("-" * 60)
+    print(f"{'Resource Type ID':<30} {'Description':<40}")
+    print("-" * 60)
+    
+    for resource_id, resource_name in sorted(RESOURCE_TYPES):
+        print(f"{resource_id:<30} {resource_name:<40}")
+        
+    print("\nUsage example: --resource-type vcns")
+
 def list_all_compartments(identity_client):
     """
     List all compartments in the tenancy with their names and IDs.
@@ -359,14 +371,17 @@ def find_cross_compartment_references(resources_by_type, target_compartment_id, 
     
     return resources_by_type
 
-def get_resource_details(client_factory, compartment_id, resource_spec, compartments=None):
+def get_resource_details(config, compartment_id, resource_spec, compartments=None):
     """Get detailed information about resources of a specific type in the compartment."""
     resource_type, resource_display = resource_spec
     resources = []
     
+    # Print which resource we're currently scanning
+    print(f"Scanning {resource_display}...")
+    
     try:
         if resource_type == 'compute_instances':
-            client = client_factory.create_client(oci.core.ComputeClient)
+            client = oci.core.ComputeClient(config)
             instances = oci.pagination.list_call_get_all_results(
                 client.list_instances, compartment_id
             ).data
@@ -382,7 +397,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'dedicated_vm_hosts':
-            client = client_factory.create_client(oci.core.ComputeClient)
+            client = oci.core.ComputeClient(config)
             hosts = oci.pagination.list_call_get_all_results(
                 client.list_dedicated_vm_hosts, compartment_id
             ).data
@@ -390,7 +405,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(extract_resource_details(host, compartments))
             
         elif resource_type == 'instance_pools':
-            client = client_factory.create_client(oci.core.ComputeClient)
+            client = oci.core.ComputeClient(config)
             pools = oci.pagination.list_call_get_all_results(
                 client.list_instance_pools, compartment_id
             ).data
@@ -398,9 +413,9 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(extract_resource_details(pool, compartments))
             
         elif resource_type == 'boot_volumes':
-            client = client_factory.create_client(oci.core.BlockstorageClient)
+            client = oci.core.BlockstorageClient(config)
             # Need to iterate through all ADs
-            identity_client = client_factory.create_client(oci.identity.IdentityClient)
+            identity_client = oci.identity.IdentityClient(config)
             ads = oci.pagination.list_call_get_all_results(
                 identity_client.list_availability_domains, compartment_id
             ).data
@@ -412,7 +427,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                     resources.append(extract_resource_details(volume, compartments))
             
         elif resource_type == 'block_volumes':
-            client = client_factory.create_client(oci.core.BlockstorageClient)
+            client = oci.core.BlockstorageClient(config)
             volumes = oci.pagination.list_call_get_all_results(
                 client.list_volumes, compartment_id
             ).data
@@ -420,7 +435,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(extract_resource_details(volume, compartments))
             
         elif resource_type == 'vcns':
-            client = client_factory.create_client(oci.core.VirtualNetworkClient)
+            client = oci.core.VirtualNetworkClient(config)
             vcns = oci.pagination.list_call_get_all_results(
                 client.list_vcns, compartment_id
             ).data
@@ -432,7 +447,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'subnets':
-            client = client_factory.create_client(oci.core.VirtualNetworkClient)
+            client = oci.core.VirtualNetworkClient(config)
             subnets = oci.pagination.list_call_get_all_results(
                 client.list_subnets, compartment_id
             ).data
@@ -448,7 +463,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'security_lists':
-            client = client_factory.create_client(oci.core.VirtualNetworkClient)
+            client = oci.core.VirtualNetworkClient(config)
             security_lists = oci.pagination.list_call_get_all_results(
                 client.list_security_lists, compartment_id
             ).data
@@ -462,7 +477,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'network_security_groups':
-            client = client_factory.create_client(oci.core.VirtualNetworkClient)
+            client = oci.core.VirtualNetworkClient(config)
             nsgs = oci.pagination.list_call_get_all_results(
                 client.list_network_security_groups, compartment_id
             ).data
@@ -480,7 +495,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'load_balancers':
-            client = client_factory.create_client(oci.load_balancer.LoadBalancerClient)
+            client = oci.load_balancer.LoadBalancerClient(config)
             lbs = oci.pagination.list_call_get_all_results(
                 client.list_load_balancers, compartment_id
             ).data
@@ -494,7 +509,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'buckets':
-            client = client_factory.create_client(oci.object_storage.ObjectStorageClient)
+            client = oci.object_storage.ObjectStorageClient(config)
             namespace = client.get_namespace().data
             buckets = oci.pagination.list_call_get_all_results(
                 client.list_buckets, namespace, compartment_id
@@ -511,9 +526,9 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                     resources.append(extract_resource_details(bucket, compartments))
             
         elif resource_type == 'file_systems':
-            client = client_factory.create_client(oci.file_storage.FileStorageClient)
+            client = oci.file_storage.FileStorageClient(config)
             # Need ADs for file systems
-            identity_client = client_factory.create_client(oci.identity.IdentityClient)
+            identity_client = oci.identity.IdentityClient(config)
             ads = oci.pagination.list_call_get_all_results(
                 identity_client.list_availability_domains, compartment_id
             ).data
@@ -525,7 +540,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                     resources.append(extract_resource_details(fs, compartments))
             
         elif resource_type == 'db_systems':
-            client = client_factory.create_client(oci.database.DatabaseClient)
+            client = oci.database.DatabaseClient(config)
             db_systems = oci.pagination.list_call_get_all_results(
                 client.list_db_systems, compartment_id
             ).data
@@ -556,7 +571,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 resources.append(resource_details)
             
         elif resource_type == 'autonomous_databases':
-            client = client_factory.create_client(oci.database.DatabaseClient)
+            client = oci.database.DatabaseClient(config)
             adbs = oci.pagination.list_call_get_all_results(
                 client.list_autonomous_databases, compartment_id
             ).data
@@ -570,7 +585,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
             
         elif resource_type == 'integration_instances':
             try:
-                client = client_factory.create_client(oci.integration.IntegrationInstanceClient)
+                client = oci.integration.IntegrationInstanceClient(config)
                 instances = oci.pagination.list_call_get_all_results(
                     client.list_integration_instances, compartment_id
                 ).data
@@ -584,7 +599,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
             
         elif resource_type == 'api_gateways':
             try:
-                client = client_factory.create_client(oci.apigateway.ApiGatewayClient)
+                client = oci.apigateway.ApiGatewayClient(config)
                 gateways = oci.pagination.list_call_get_all_results(
                     client.list_gateways, compartment_id
                 ).data
@@ -606,7 +621,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
             
         elif resource_type == 'vaults':
             try:
-                client = client_factory.create_client(oci.key_management.KmsVaultClient)
+                client = oci.key_management.KmsVaultClient(config)
                 vaults = oci.pagination.list_call_get_all_results(
                     client.list_vaults, compartment_id
                 ).data
@@ -620,7 +635,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
             
         elif resource_type == 'secrets':
             try:
-                client = client_factory.create_client(oci.vault.VaultsClient)
+                client = oci.vault.VaultsClient(config)
                 secrets = oci.pagination.list_call_get_all_results(
                     client.list_secrets, compartment_id
                 ).data
@@ -630,7 +645,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                     # For secrets, add vault name if possible
                     if hasattr(secret, 'vault_id'):
                         try:
-                            vault_client = client_factory.create_client(oci.key_management.KmsVaultClient)
+                            vault_client = oci.key_management.KmsVaultClient(config)
                             vault = vault_client.get_vault(secret.vault_id).data
                             resource_details['vault_name'] = vault.display_name if hasattr(vault, 'display_name') else None
                         except:
@@ -643,7 +658,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
         elif resource_type == 'sftp_servers':
             # Try File Storage SFTP
             try:
-                client = client_factory.create_client(oci.file_storage.FileStorageClient)
+                client = oci.file_storage.FileStorageClient(config)
                 servers = oci.pagination.list_call_get_all_results(
                     client.list_transfer_servers, compartment_id
                 ).data
@@ -664,7 +679,7 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
             except:
                 # Try Transfer service
                 try:
-                    client = client_factory.create_client(oci.transfer.TransferClient)
+                    client = oci.transfer.TransferClient(config)
                     servers = oci.pagination.list_call_get_all_results(
                         client.list_transfer_servers, compartment_id
                     ).data
@@ -677,53 +692,54 @@ def get_resource_details(client_factory, compartment_id, resource_spec, compartm
                 
     except Exception as e:
         print(f"Error getting {resource_display}: {e}")
+    
+    # Report how many resources were found
+    if resources:
+        print(f"  Found {len(resources)} {resource_display}")
+    else:
+        print(f"  No {resource_display} found")
         
     return (resource_type, resource_display, resources)
 
-def scan_resources(config, compartment_id):
-    """Scan all resources in the compartment and return details."""
+def scan_resources(config, compartment_id, resource_type_filter=None):
+    """Scan resources in the compartment and return details."""
     print(f"Scanning resources in compartment {compartment_id}...")
-    
-    # Create client factory
-    try:
-        # Try instance principals first
-        client_factory = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-        client_factory.get_security_token()
-        print("Using instance principals authentication")
-    except:
-        # Fall back to config file
-        print("Using config file authentication")
-        client_factory = config
     
     # Get all compartments for cross-reference lookup
     identity_client = oci.identity.IdentityClient(config)
     compartments = get_all_compartments(identity_client)
     print(f"Found {len(compartments)} compartments in the tenancy")
     
+    # Filter resource types if requested
+    if resource_type_filter:
+        resource_types_to_scan = [(rt, rd) for rt, rd in RESOURCE_TYPES if rt == resource_type_filter]
+        if not resource_types_to_scan:
+            print(f"Error: Resource type '{resource_type_filter}' not found.")
+            print_available_resource_types()
+            sys.exit(1)
+        print(f"Filtering to scan only: {resource_types_to_scan[0][1]}")
+    else:
+        resource_types_to_scan = RESOURCE_TYPES
+    
     # Create a thread pool to scan resources in parallel
     results = {}
     start_time = time.time()
     
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(get_resource_details, client_factory, compartment_id, resource_spec, compartments): 
-            resource_spec for resource_spec in RESOURCE_TYPES
-        }
-        
-        for i, future in enumerate(as_completed(futures)):
-            resource_spec = futures[future]
-            try:
-                resource_type, resource_display, resources = future.result()
-                results[resource_type] = {
-                    'display_name': resource_display,
-                    'resources': resources,
-                    'count': len(resources)
-                }
-                
-                # Progress indicator
-                print(f"Progress: {i+1}/{len(RESOURCE_TYPES)} resources checked", end="\r")
-            except Exception as e:
-                print(f"Error checking {resource_spec[1]}: {e}")
+    print("\nBeginning resource scan...")
+    
+    # Using sequential scanning for better visibility
+    for resource_spec in resource_types_to_scan:
+        try:
+            resource_type, resource_display, resources = get_resource_details(
+                config, compartment_id, resource_spec, compartments
+            )
+            results[resource_type] = {
+                'display_name': resource_display,
+                'resources': resources,
+                'count': len(resources)
+            }
+        except Exception as e:
+            print(f"Error scanning {resource_spec[1]}: {e}")
     
     # Analyze cross-compartment references
     results = find_cross_compartment_references(results, compartment_id, compartments)
@@ -918,8 +934,22 @@ def main():
     parser.add_argument('--output', help='Output file for JSON or directory for CSV')
     parser.add_argument('--list-compartments', action='store_true', 
                         help='List all available compartments before scanning')
+    parser.add_argument('--resource-type', 
+                        help='Scan only a specific resource type (e.g., compute_instances, vcns, buckets)')
+    parser.add_argument('--list-resource-types', action='store_true',
+                        help='List all available resource types that can be scanned')
     
     args = parser.parse_args()
+    
+    # List resource types if requested
+    if args.list_resource_types:
+        print_available_resource_types()
+        sys.exit(0)
+    
+    # Special case for "help" as resource type
+    if args.resource_type and args.resource_type.lower() == 'help':
+        print_available_resource_types()
+        sys.exit(0)
     
     # Load OCI config
     try:
@@ -962,7 +992,7 @@ def main():
         sys.exit(1)
     
     # Scan resources
-    results = scan_resources(config, compartment_id)
+    results = scan_resources(config, compartment_id, args.resource_type)
     
     # Determine default output file/directory if not specified
     if args.output_format in ['json', 'csv'] and not args.output:
