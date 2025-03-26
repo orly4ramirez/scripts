@@ -123,7 +123,7 @@ REFERENCE_ATTRIBUTES = [
 class Logger(object):
     def __init__(self, filename):
         self.terminal = sys.stdout
-        self.log = open(filename, "w")
+        self.log = open(filename, "w", encoding='utf-8')
         
     def write(self, message):
         self.terminal.write(message)
@@ -134,7 +134,8 @@ class Logger(object):
         self.log.flush()
         
     def close(self):
-        self.log.close()
+        if self.log:
+            self.log.close()
 
 def init_logger(output_dir):
     """Initialize the logger to capture console output to a file."""
@@ -1110,9 +1111,6 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
         elif resource_type == 'keys':
             try:
                 # KMS client for key management
-                client = oci.key_management.KmsManagementClient(config)
-                
-                # First, get all vaults
                 vault_client = oci.key_management.KmsVaultClient(config)
                 vaults = oci.pagination.list_call_get_all_results(
                     vault_client.list_vaults,
@@ -1131,10 +1129,12 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                             
                         # Create a new config with the vault's management endpoint
                         vault_config = config.copy()
-                        vault_config['service_endpoint'] = vault_details.management_endpoint
                         
                         # Create a client with the vault endpoint
-                        kms_client = oci.key_management.KmsManagementClient(vault_config)
+                        kms_client = oci.key_management.KmsManagementClient(
+                            vault_config, 
+                            service_endpoint=vault_details.management_endpoint  # Pass endpoint as a parameter
+                        )
                         
                         # List keys in this vault
                         vault_keys = oci.pagination.list_call_get_all_results(
@@ -1431,7 +1431,7 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             try:
                 client = oci.artifacts.ArtifactsClient(config)
                 artifacts = oci.pagination.list_call_get_all_results(
-                    client.list_artifacts,
+                    client.list_generic_artifacts,  # Fixed from list_artifacts
                     compartment_id=compartment_id
                 ).data
                 
@@ -1817,16 +1817,18 @@ def main():
         sys.exit(0)
     
     # Determine default output directory
+    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
     if not args.output:
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         output_dir = f"oci_resources_{timestamp}"
     else:
         output_dir = args.output
+        if args.output_format == 'json' and not os.path.isdir(output_dir):
+            # For JSON output, if the output is not a directory, use its parent directory
+            output_dir = os.path.dirname(output_dir) or '.'
         
-    # Initialize the logger to capture console output
-    if args.output_format in ['json', 'csv']:
-        log_file = init_logger(output_dir)
-        print(f"Capturing console output to {log_file}")
+    # Initialize the logger to capture console output - ALWAYS create the log
+    log_file = init_logger(output_dir)
+    print(f"Capturing console output to {log_file}")
     
     # Load OCI config
     try:
@@ -1874,27 +1876,21 @@ def main():
     # Print resource summary
     print_resource_summary(results)
     
-    # Determine default output file/directory if not specified
-    if args.output_format in ['json', 'csv'] and not args.output:
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        if args.output_format == 'json':
-            args.output = f"oci_resources_{timestamp}.json"
-        else:
-            args.output = f"oci_resources_{timestamp}"
-    
     # Output results based on format
     if args.output_format == 'json':
+        if not args.output:
+            args.output = os.path.join(output_dir, f"oci_resources_{timestamp}.json")
         save_to_json(results, compartment_info, args.output)
     elif args.output_format == 'csv':
-        save_to_csv(results, compartment_info, args.output)
+        save_to_csv(results, compartment_info, output_dir)
     
     print("\nTo see detailed resource information, use --output-format json or csv")
     
     # Reset stdout if we were logging
-    if args.output_format in ['json', 'csv'] and isinstance(sys.stdout, Logger):
+    if isinstance(sys.stdout, Logger):
         sys.stdout.close()
         sys.stdout = sys.__stdout__
-        print(f"Analysis complete. Results saved to {args.output}")
+        print(f"Analysis complete. Results saved to {args.output if args.output_format == 'json' else output_dir}")
         print(f"Console output captured in {log_file}")
 
 if __name__ == "__main__":
