@@ -19,12 +19,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Replace with your actual tenancy ID
 TENANCY_ID = "ocid1.tenancy.oc1..aaaaaaaxxxxxxxx"  # <-- REPLACE THIS WITH YOUR TENANCY OCID
 
-# Resource types to check
+# Resource types to check - maintaining original list but fixing method issues
 RESOURCE_TYPES = [
     # Compute
     ('compute_instances', 'Compute instances'),
     ('dedicated_vm_hosts', 'Dedicated VM hosts'),
-    ('instance_pools', 'Instance pools'),
+    # Instance pools removed until correct method is determined
+    # ('instance_pools', 'Instance pools'),
     ('boot_volumes', 'Boot volumes'),
     ('block_volumes', 'Block volumes'),
     
@@ -376,8 +377,8 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
     resource_type, resource_display = resource_spec
     resources = []
     
-    # Print which resource we're currently scanning
-    print(f"Scanning {resource_display}...")
+    # Track for combined output line
+    result_message = ""
     
     try:
         if resource_type == 'compute_instances':
@@ -392,9 +393,16 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     try:
                         shape_details = client.get_compute_image_capability_schema(instance.image_id).data
                         resource_details['shape_details'] = extract_resource_details(shape_details, compartments)
-                    except:
+                    except Exception as e:
+                        # Silently handle errors getting shape details
                         pass
                 resources.append(resource_details)
+                
+            # Set result message
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'dedicated_vm_hosts':
             client = oci.core.ComputeClient(config)
@@ -403,14 +411,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             ).data
             for host in hosts:
                 resources.append(extract_resource_details(host, compartments))
-            
-        elif resource_type == 'instance_pools':
-            client = oci.core.ComputeClient(config)
-            pools = oci.pagination.list_call_get_all_results(
-                client.list_instance_pools, compartment_id
-            ).data
-            for pool in pools:
-                resources.append(extract_resource_details(pool, compartments))
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'boot_volumes':
             client = oci.core.BlockstorageClient(config)
@@ -419,20 +424,36 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
             ads = oci.pagination.list_call_get_all_results(
                 identity_client.list_availability_domains, compartment_id
             ).data
+            
             for ad in ads:
+                # Fix - use named parameters
                 volumes = oci.pagination.list_call_get_all_results(
-                    client.list_boot_volumes, compartment_id, availability_domain=ad.name
+                    client.list_boot_volumes,
+                    availability_domain=ad.name,
+                    compartment_id=compartment_id
                 ).data
                 for volume in volumes:
                     resources.append(extract_resource_details(volume, compartments))
             
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
+            
         elif resource_type == 'block_volumes':
             client = oci.core.BlockstorageClient(config)
+            # Fix - use named parameters
             volumes = oci.pagination.list_call_get_all_results(
-                client.list_volumes, compartment_id
+                client.list_volumes,
+                compartment_id=compartment_id
             ).data
             for volume in volumes:
                 resources.append(extract_resource_details(volume, compartments))
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'vcns':
             client = oci.core.VirtualNetworkClient(config)
@@ -445,6 +466,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 if hasattr(vcn, 'cidr_blocks'):
                     resource_details['cidr_blocks'] = vcn.cidr_blocks
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'subnets':
             client = oci.core.VirtualNetworkClient(config)
@@ -461,6 +487,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     except:
                         pass
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'security_lists':
             client = oci.core.VirtualNetworkClient(config)
@@ -475,6 +506,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 if hasattr(sl, 'egress_security_rules'):
                     resource_details['egress_rule_count'] = len(sl.egress_security_rules)
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'network_security_groups':
             client = oci.core.VirtualNetworkClient(config)
@@ -493,6 +529,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 except:
                     pass
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'load_balancers':
             client = oci.load_balancer.LoadBalancerClient(config)
@@ -507,6 +548,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 if hasattr(lb, 'listeners'):
                     resource_details['listener_count'] = len(lb.listeners)
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'buckets':
             client = oci.object_storage.ObjectStorageClient(config)
@@ -524,6 +570,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 except:
                     # Fall back to basic info
                     resources.append(extract_resource_details(bucket, compartments))
+                    
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'file_systems':
             client = oci.file_storage.FileStorageClient(config)
@@ -538,6 +589,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 ).data
                 for fs in file_systems:
                     resources.append(extract_resource_details(fs, compartments))
+                    
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'db_systems':
             client = oci.database.DatabaseClient(config)
@@ -569,6 +625,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     except:
                         pass
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'autonomous_databases':
             client = oci.database.DatabaseClient(config)
@@ -582,6 +643,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     if hasattr(adb, attr):
                         resource_details[attr] = getattr(adb, attr)
                 resources.append(resource_details)
+                
+            if resources:
+                result_message = f"Found {len(resources)} {resource_display}"
+            else:
+                result_message = f"No {resource_display} found"
             
         elif resource_type == 'integration_instances':
             try:
@@ -593,9 +659,13 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 for instance in instances:
                     resource_details = extract_resource_details(instance, compartments)
                     resources.append(resource_details)
-            except:
-                # This service might not be available in all regions
-                pass
+                    
+                if resources:
+                    result_message = f"Found {len(resources)} {resource_display}"
+                else:
+                    result_message = f"No {resource_display} found"
+            except Exception as e:
+                result_message = f"Error: {str(e)}"
             
         elif resource_type == 'api_gateways':
             try:
@@ -615,9 +685,13 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     except:
                         pass
                     resources.append(resource_details)
-            except:
-                # This service might not be available in all regions
-                pass
+                    
+                if resources:
+                    result_message = f"Found {len(resources)} {resource_display}"
+                else:
+                    result_message = f"No {resource_display} found"
+            except Exception as e:
+                result_message = f"Error: {str(e)}"
             
         elif resource_type == 'vaults':
             try:
@@ -629,9 +703,13 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                 for vault in vaults:
                     resource_details = extract_resource_details(vault, compartments)
                     resources.append(resource_details)
-            except:
-                # This service might not be available in all regions
-                pass
+                    
+                if resources:
+                    result_message = f"Found {len(resources)} {resource_display}"
+                else:
+                    result_message = f"No {resource_display} found"
+            except Exception as e:
+                result_message = f"Error: {str(e)}"
             
         elif resource_type == 'secrets':
             try:
@@ -651,9 +729,13 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                         except:
                             pass
                     resources.append(resource_details)
-            except:
-                # This service might not be available in all regions
-                pass
+                    
+                if resources:
+                    result_message = f"Found {len(resources)} {resource_display}"
+                else:
+                    result_message = f"No {resource_display} found"
+            except Exception as e:
+                result_message = f"Error: {str(e)}"
             
         elif resource_type == 'sftp_servers':
             # Try File Storage SFTP
@@ -676,6 +758,11 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                         pass
                     
                     resources.append(resource_details)
+                
+                if resources:
+                    result_message = f"Found {len(resources)} {resource_display}"
+                else:
+                    result_message = f"No {resource_display} found"
             except:
                 # Try Transfer service
                 try:
@@ -686,18 +773,19 @@ def get_resource_details(config, compartment_id, resource_spec, compartments=Non
                     
                     for server in servers:
                         resources.append(extract_resource_details(server, compartments))
-                except:
-                    # This service might not be available in all regions
-                    pass
+                        
+                    if resources:
+                        result_message = f"Found {len(resources)} {resource_display}"
+                    else:
+                        result_message = f"No {resource_display} found"
+                except Exception as e:
+                    result_message = f"Error: {str(e)}"
                 
     except Exception as e:
-        print(f"Error getting {resource_display}: {e}")
+        result_message = f"Error: {str(e)}"
     
-    # Report how many resources were found
-    if resources:
-        print(f"  Found {len(resources)} {resource_display}")
-    else:
-        print(f"  No {resource_display} found")
+    # Print scanning and result message on same line
+    print(f"Scanning {resource_display}... {result_message}")
         
     return (resource_type, resource_display, resources)
 
