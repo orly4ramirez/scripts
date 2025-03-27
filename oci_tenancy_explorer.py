@@ -373,7 +373,14 @@ def get_service_clients(config):
     clients['load_balancer'] = oci.load_balancer.LoadBalancerClient(config)
     clients['file_storage'] = oci.file_storage.FileStorageClient(config)
     
-    # Additional services (initialize only what we need)
+    # Resource Search client (critical for getting all resources)
+    try:
+        clients['search'] = oci.resource_search.ResourceSearchClient(config)
+    except Exception as e:
+        print(f"Error initializing Resource Search client: {e}")
+        print("WARNING: Resource Search client is required for comprehensive resource discovery!")
+    
+    # Additional services 
     try:
         clients['container_engine'] = oci.container_engine.ContainerEngineClient(config)
         clients['functions'] = oci.functions.FunctionsManagementClient(config)
@@ -395,7 +402,6 @@ def get_service_clients(config):
         clients['audit'] = oci.audit.AuditClient(config)
         clients['announcements'] = oci.announcements_service.AnnouncementClient(config)
         clients['usage'] = oci.usage_api.UsageapiClient(config)
-        clients['oke'] = oci.container_engine.ContainerEngineClient(config)
         clients['email'] = oci.email.EmailClient(config)
         clients['data_catalog'] = oci.data_catalog.DataCatalogClient(config)
     except Exception as e:
@@ -614,14 +620,91 @@ def map_resource_type_to_service(resource_type, clients):
     return None, None
 
 def explore_tenancy(compartment_id, compartment_name, clients, max_workers=10):
-    """Explore a compartment to find all resources."""
-    # Define resource tasks for the compartment
-    resource_tasks = define_resource_tasks(clients, compartment_id)
-    
-    # Extract resources in parallel
+    """Explore a compartment using Resource Search API + detailed service calls."""
     all_resources = []
     
-    print(f"\nExploring resources in {compartment_name}...")
+    # First, use the Resource Search API to discover all resources
+    if 'search' in clients:
+        print(f"\nDiscovering all resources in {compartment_name} using Resource Search API...")
+        search_client = clients['search']
+        
+        # Query all resources in the compartment
+        query = f"query all resources where compartmentId = '{compartment_id}'"
+        search_details = oci.resource_search.models.StructuredSearchDetails(
+            type="Structured",
+            query=query
+        )
+        
+        try:
+            response = oci.pagination.list_call_get_all_results(
+                search_client.search_resources,
+                search_details=search_details,
+                limit=1000
+            )
+            
+            discovered_resources = response.data.items
+            print(f"Resource Search found {len(discovered_resources)} resources in {compartment_name}")
+            
+            # Group discovered resources by type for progress tracking
+            resource_type_counts = {}
+            for resource in discovered_resources:
+                resource_type = resource.resource_type
+                if resource_type not in resource_type_counts:
+                    resource_type_counts[resource_type] = 0
+                resource_type_counts[resource_type] += 1
+            
+            # Print summary of discovered resource types
+            print("Resource types found:")
+            for resource_type, count in resource_type_counts.items():
+                print(f"  - {resource_type}: {count}")
+            
+            # Process the resources in parallel to extract detailed information
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                
+                # Submit tasks to extract detailed information for each resource
+                for resource in discovered_resources:
+                    resource_type = resource.resource_type
+                    resource_id = resource.identifier
+                    
+                    future = executor.submit(
+                        extract_resource_details,
+                        clients, 
+                        resource_type, 
+                        resource_id, 
+                        compartment_id, 
+                        compartment_name
+                    )
+                    futures.append((future, resource_type, resource_id))
+                
+                # Collect results
+                completed = 0
+                total = len(futures)
+                for future, resource_type, resource_id in futures:
+                    try:
+                        resource_details = future.result()
+                        completed += 1
+                        
+                        if resource_details:
+                            all_resources.append(resource_details)
+                            print(f"[{completed}/{total}] {resource_type}: {resource_details.get('Name', 'unnamed')}")
+                        else:
+                            print(f"[{completed}/{total}] {resource_type}: Could not extract details for {resource_id}")
+                    except Exception as e:
+                        completed += 1
+                        print(f"[{completed}/{total}] Error processing {resource_type} {resource_id}: {str(e)[:100]}")
+            
+            return all_resources
+            
+        except Exception as e:
+            print(f"Error using Resource Search API: {e}")
+            print("Falling back to conventional resource discovery...")
+    
+    # Fall back to traditional approach if Resource Search API fails
+    # Define resource tasks
+    resource_tasks = define_resource_tasks(clients, compartment_id)
+    
+    print(f"\nFalling back to conventional resource discovery in {compartment_name}...")
     print(f"Found {len(resource_tasks)} resource types to scan")
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -647,6 +730,209 @@ def explore_tenancy(compartment_id, compartment_name, clients, max_workers=10):
                 completed += 1
     
     return all_resources
+
+def extract_resource_details(clients, resource_type, resource_id, compartment_id, compartment_name):
+    """Extract detailed information for a specific resource discovered by Resource Search."""
+    try:
+        # Map the resource type to appropriate client and method
+        client, get_method = get_detail_method_for_resource_type(clients, resource_type)
+        
+        if not client or not get_method:
+            # If we don't have a mapping, create a basic resource record from the resource_id
+            return {
+                'Compartment Name': compartment_name,
+                'Compartment ID': compartment_id,
+                'Resource Group': 'N/A',
+                'Service': resource_type.split('.')[0] if '.' in resource_type else 'Unknown',
+                'Resource Type': resource_type,
+                'Resource ID': resource_id,
+                'Name': resource_id.split('.')[-1] if '.' in resource_id else resource_id,
+                'Region': 'N/A',
+                'Availability Domain': 'N/A',
+                'Shape': 'N/A',
+                'OCPU Count': 'N/A',
+                'Memory': 'N/A',
+                'Storage Size': 'N/A',
+                'CIDR Block': 'N/A',
+                'Public Access': 'N/A',
+                'Parent Resource': 'N/A',
+                'Cross-Compartment References': 'N/A',
+                'Lifecycle State': 'UNKNOWN',
+                'Time Created': 'N/A',
+                'Last Modified': 'N/A',
+                'Defined Tags': '{}',
+                'Freeform Tags': '{}',
+                'Additional Details': f"Resource details not available for type: {resource_type}"
+            }
+        
+        # Call the appropriate detail method
+        resource_details = get_method(resource_id)
+        
+        # Extract basic information common to most resources
+        display_name = getattr(resource_details, 'display_name', getattr(resource_details, 'name', 'N/A'))
+        lifecycle_state = getattr(resource_details, 'lifecycle_state', 'N/A')
+        time_created = getattr(resource_details, 'time_created', 'N/A')
+        if time_created and time_created != 'N/A' and hasattr(time_created, 'strftime'):
+            time_created = time_created.strftime('%Y-%m-%d %H:%M:%S')
+            
+        defined_tags = getattr(resource_details, 'defined_tags', {})
+        freeform_tags = getattr(resource_details, 'freeform_tags', {})
+        availability_domain = getattr(resource_details, 'availability_domain', 'N/A')
+        
+        # Extract resource group from defined tags if available
+        resource_group = 'N/A'
+        if defined_tags and isinstance(defined_tags, dict):
+            if 'Oracle-ResourceGroup' in defined_tags:
+                rg_tags = defined_tags['Oracle-ResourceGroup']
+                if isinstance(rg_tags, dict):
+                    if 'resourcegroup' in rg_tags:
+                        resource_group = rg_tags['resourcegroup']
+                    elif 'ResourceGroup' in rg_tags:
+                        resource_group = rg_tags['ResourceGroup']
+        
+        # Extract resource-specific details based on type
+        resource_shape = 'N/A'
+        ocpu_count = 'N/A'
+        memory_size = 'N/A'
+        storage_size = 'N/A'
+        cidr_block = 'N/A'
+        is_public = 'N/A'
+        parent_resource = 'N/A'
+        cross_compartment_refs = []
+        
+        # Resource-specific extractions (expand as needed)
+        if 'instance' in resource_type.lower():
+            resource_shape = getattr(resource_details, 'shape', 'N/A')
+            shape_config = getattr(resource_details, 'shape_config', None)
+            if shape_config:
+                ocpu_count = getattr(shape_config, 'ocpus', 'N/A')
+                memory_size = f"{getattr(shape_config, 'memory_in_gbs', 'N/A')} GB"
+            if hasattr(resource_details, 'public_ip') and resource_details.public_ip:
+                is_public = 'Yes'
+            else:
+                is_public = 'No'
+                
+        elif 'volume' in resource_type.lower():
+            storage_size = f"{getattr(resource_details, 'size_in_gbs', 'N/A')} GB"
+            
+        elif 'vcn' in resource_type.lower():
+            cidr_block = getattr(resource_details, 'cidr_block', 'N/A')
+            
+        elif 'subnet' in resource_type.lower():
+            cidr_block = getattr(resource_details, 'cidr_block', 'N/A')
+            vcn_id = getattr(resource_details, 'vcn_id', 'N/A')
+            parent_resource = f"VCN: {vcn_id}"
+            is_public = 'Yes' if getattr(resource_details, 'prohibit_public_ip_on_vnic', False) == False else 'No'
+            
+        elif 'autonomousdatabase' in resource_type.lower():
+            storage_size = f"{getattr(resource_details, 'data_storage_size_in_tbs', 'N/A')} TB"
+            ocpu_count = getattr(resource_details, 'cpu_core_count', 'N/A')
+            db_version = getattr(resource_details, 'db_version', 'N/A')
+            resource_shape = f"Autonomous DB v{db_version}" if db_version != 'N/A' else 'N/A'
+            
+        # Get last modified time if available
+        last_modified = 'N/A'
+        if hasattr(resource_details, 'time_updated'):
+            time_updated = getattr(resource_details, 'time_updated', 'N/A')
+            if time_updated and time_updated != 'N/A' and hasattr(time_updated, 'strftime'):
+                last_modified = time_updated.strftime('%Y-%m-%d %H:%M:%S')
+                
+        # Additional details as a string
+        additional_details = {}
+        for attr in dir(resource_details):
+            if not attr.startswith('_') and not callable(getattr(resource_details, attr)) and attr not in [
+                'id', 'display_name', 'name', 'lifecycle_state', 'time_created', 'defined_tags',
+                'freeform_tags', 'availability_domain', 'shape', 'shape_config', 'size_in_gbs',
+                'cidr_block', 'vcn_id', 'data_storage_size_in_tbs', 'cpu_core_count', 'db_version',
+                'time_updated', 'public_ip', 'prohibit_public_ip_on_vnic'
+            ]:
+                value = getattr(resource_details, attr)
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    additional_details[attr] = value
+                    
+        additional_details_str = '; '.join([f"{k}={v}" for k, v in additional_details.items() if v is not None])
+        
+        # Format cross compartment references
+        cross_compartment_str = '; '.join(cross_compartment_refs) if cross_compartment_refs else 'None'
+        
+        # Build the detailed resource record
+        return {
+            'Compartment Name': compartment_name,
+            'Compartment ID': compartment_id,
+            'Resource Group': resource_group,
+            'Service': resource_type.split('.')[0] if '.' in resource_type else resource_type,
+            'Resource Type': resource_type,
+            'Resource ID': resource_id,
+            'Name': display_name,
+            'Region': resource_id.split('.')[3] if len(resource_id.split('.')) > 3 else 'N/A',
+            'Availability Domain': availability_domain,
+            'Shape': resource_shape,
+            'OCPU Count': ocpu_count,
+            'Memory': memory_size,
+            'Storage Size': storage_size,
+            'CIDR Block': cidr_block,
+            'Public Access': is_public,
+            'Parent Resource': parent_resource,
+            'Cross-Compartment References': cross_compartment_str,
+            'Lifecycle State': lifecycle_state,
+            'Time Created': time_created,
+            'Last Modified': last_modified,
+            'Defined Tags': str(defined_tags),
+            'Freeform Tags': str(freeform_tags),
+            'Additional Details': additional_details_str
+        }
+        
+    except Exception as e:
+        # If we couldn't extract details, return minimal information
+        print(f"Error extracting details for {resource_type} {resource_id}: {e}")
+        return None
+        
+def get_detail_method_for_resource_type(clients, resource_type):
+    """Map a resource type to the appropriate client and get method."""
+    resource_type_lower = resource_type.lower()
+    
+    # Direct mappings for common resource types
+    mappings = {
+        'instance': (clients.get('compute'), 
+                    lambda id: clients['compute'].get_instance(id).data),
+        'volume': (clients.get('block_storage'), 
+                  lambda id: clients['block_storage'].get_volume(id).data),
+        'bootvolumeattachment': (clients.get('compute'), 
+                                lambda id: clients['compute'].get_boot_volume_attachment(id).data),
+        'volumeattachment': (clients.get('compute'), 
+                            lambda id: clients['compute'].get_volume_attachment(id).data),
+        'vcn': (clients.get('network'), 
+               lambda id: clients['network'].get_vcn(id).data),
+        'subnet': (clients.get('network'), 
+                  lambda id: clients['network'].get_subnet(id).data),
+        'internetgateway': (clients.get('network'), 
+                           lambda id: clients['network'].get_internet_gateway(id).data),
+        'routetable': (clients.get('network'), 
+                      lambda id: clients['network'].get_route_table(id).data),
+        'securitylist': (clients.get('network'), 
+                        lambda id: clients['network'].get_security_list(id).data),
+        'networksecuritygroup': (clients.get('network'), 
+                                lambda id: clients['network'].get_network_security_group(id).data),
+        'autonomousdatabase': (clients.get('database'), 
+                              lambda id: clients['database'].get_autonomous_database(id).data),
+        'dbsystem': (clients.get('database'), 
+                    lambda id: clients['database'].get_db_system(id).data),
+        'filesystem': (clients.get('file_storage'), 
+                      lambda id: clients['file_storage'].get_file_system(id).data),
+        'mounttarget': (clients.get('file_storage'), 
+                       lambda id: clients['file_storage'].get_mount_target(id).data),
+        'loadbalancer': (clients.get('load_balancer'), 
+                        lambda id: clients['load_balancer'].get_load_balancer(id).data),
+    }
+    
+    # Try to find a match
+    for key, (client, method) in mappings.items():
+        if key in resource_type_lower:
+            if client:  # Only return if the client exists
+                return client, method
+    
+    # If no match, return None
+    return None, None
 
 def write_csv(resources, output_file):
     """Write resources to CSV file."""
