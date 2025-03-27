@@ -100,7 +100,19 @@ REFERENCE_ATTRIBUTES = [
     'nat_gateway_id',
     'internet_gateway_id',
     'dhcp_options_id',
-    'dns_resolver_id'
+    'dns_resolver_id',
+    # Added more reference attributes that might be missed
+    'backup_id',
+    'topic_id',
+    'attachment_id',
+    'private_ip_id',
+    'public_ip_id',
+    'security_list_id',
+    'log_group_id',
+    'log_id',
+    'vnic_id',
+    'endpoint_id',
+    'resource_id',
 ]
 
 def parse_arguments():
@@ -234,6 +246,19 @@ def extract_resource_details(resource, compartments=None, resource_type='Unknown
             if isinstance(value, datetime):
                 value = value.isoformat()
             details[attr] = value
+    
+    # Check for lifecycle state in multiple attributes
+    state_attrs = ['lifecycle_state', 'status', 'state', 'resource_state', 'state_code']
+    lifecycle_state_found = False
+    
+    for state_attr in state_attrs:
+        if hasattr(resource, state_attr) and getattr(resource, state_attr):
+            details['lifecycle_state'] = getattr(resource, state_attr)
+            lifecycle_state_found = True
+            break
+    
+    if not lifecycle_state_found:
+        details['lifecycle_state'] = 'N/A'
     
     # Add compartment name if possible
     if compartments and hasattr(resource, 'compartment_id') and resource.compartment_id in compartments:
@@ -1070,19 +1095,23 @@ def find_cross_compartment_references(resources_by_type, compartment_map):
     """Find cross-compartment references."""
     print("Analyzing cross-compartment references...")
     
-    # Create a map of resource IDs to resource details
+    # Create a more comprehensive map of resource IDs to resource details
     resource_id_map = {}
+    
+    # First pass - collect all resource IDs
     for resource_type, info in resources_by_type.items():
         for resource in info['resources']:
+            # Add primary resource ID
             if 'resource_id' in resource and resource['resource_id'] != 'N/A':
                 resource_id_map[resource['resource_id']] = {
                     'type': resource_type,
                     'details': resource
                 }
     
-    # Find cross-compartment references
+    # Track cross-compartment references
     cross_compartment_refs = 0
     
+    # Second pass - find cross-compartment references
     for resource_type, info in resources_by_type.items():
         for resource in info['resources']:
             if 'compartment_id' not in resource:
@@ -1092,29 +1121,34 @@ def find_cross_compartment_references(resources_by_type, compartment_map):
             
             # Check all resource attributes for potential cross-compartment references
             for attr, value in resource.items():
-                if attr in REFERENCE_ATTRIBUTES and isinstance(value, str) and value.startswith('ocid1.'):
-                    # Is this a reference to a resource in our map?
-                    if value in resource_id_map:
-                        referenced_resource = resource_id_map[value]
-                        referenced_details = referenced_resource['details']
+                if (attr.endswith('_id') and isinstance(value, str) and 
+                    value.startswith('ocid1.') and value in resource_id_map):
+                    
+                    # Found a reference to another resource
+                    referenced_resource = resource_id_map[value]
+                    referenced_details = referenced_resource['details']
+                    
+                    # Only proceed if we have compartment ID for both resources
+                    if 'compartment_id' not in referenced_details:
+                        continue
                         
-                        # Only proceed if we have compartment ID for both resources
-                        if 'compartment_id' not in referenced_details:
-                            continue
-                            
-                        referenced_compartment_id = referenced_details['compartment_id']
+                    referenced_compartment_id = referenced_details['compartment_id']
+                    
+                    # Is this a cross-compartment reference?
+                    if (referenced_compartment_id != resource_compartment_id and 
+                        attr in REFERENCE_ATTRIBUTES):
+                        cross_compartment_refs += 1
                         
-                        # Is this a cross-compartment reference?
-                        if referenced_compartment_id != resource_compartment_id:
-                            cross_compartment_refs += 1
+                        # Add cross-compartment reference info
+                        if 'cross_compartment_references' not in resource or resource['cross_compartment_references'] == 'None':
+                            resource['cross_compartment_references'] = ''
                             
-                            # Add cross-compartment reference info
-                            if 'cross_compartment_references' not in resource or resource['cross_compartment_references'] == 'None':
-                                resource['cross_compartment_references'] = ''
-                                
-                            # Add reference details with compartment name
-                            ref_compartment_name = compartment_map[referenced_compartment_id].name if referenced_compartment_id in compartment_map else 'Unknown'
-                            resource['cross_compartment_references'] += f"{attr}:{value} (in {ref_compartment_name}); "
+                        # Add reference details with compartment name
+                        ref_compartment_name = get_compartment_path(referenced_compartment_id, compartment_map) if referenced_compartment_id in compartment_map else 'Unknown'
+                        
+                        # Add the resource name if available
+                        ref_resource_name = referenced_details.get('resource_name', 'Unnamed')
+                        resource['cross_compartment_references'] += f"{attr}: {ref_resource_name} [{value}] (in {ref_compartment_name}); "
     
     # Clean up cross-compartment references formatting
     for resource_type, info in resources_by_type.items():
@@ -1129,18 +1163,20 @@ def find_cross_compartment_references(resources_by_type, compartment_map):
     
     return resources_by_type
 
-def flatten_resources(resources_by_type, compartment_info):
+def flatten_resources(resources_by_type, compartment_info, compartment_map):
     """Flatten resources into a list for CSV output."""
     flattened = []
     
     for resource_type, info in resources_by_type.items():
         for resource in info['resources']:
-            # Add additional fields
-            if 'compartment_name' not in resource:
+            # Add full compartment path if it has a compartment_id
+            if 'compartment_id' in resource and resource['compartment_id'] in compartment_map:
+                resource['compartment_name'] = get_compartment_path(resource['compartment_id'], compartment_map)
+            elif 'compartment_name' not in resource:
                 resource['compartment_name'] = compartment_info.get('name', 'Unknown')
-                
+            
             # Ensure lifecycle state is properly captured
-            if 'lifecycle_state' in resource and resource['lifecycle_state'] == 'N/A':
+            if 'lifecycle_state' in resource and (resource['lifecycle_state'] == 'N/A' or not resource['lifecycle_state']):
                 # Check for status field as an alternative
                 if 'status' in resource and resource['status'] != 'N/A':
                     resource['lifecycle_state'] = resource['status']
@@ -1292,7 +1328,7 @@ def main():
     all_resources_by_type = find_cross_compartment_references(all_resources_by_type, compartment_map)
     
     # Flatten resources for CSV output
-    flattened_resources = flatten_resources(all_resources_by_type, compartment_info)
+    flattened_resources = flatten_resources(all_resources_by_type, compartment_info, compartment_map)
     
     # Define CSV headers with the correct order
     base_headers = [
