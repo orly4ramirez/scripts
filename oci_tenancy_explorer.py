@@ -414,18 +414,19 @@ def define_resource_tasks(clients, compartment_id):
             ("Images", clients['compute'].list_images),
             ("Boot Volume Attachments", clients['compute'].list_boot_volume_attachments),
             ("Volume Attachments", clients['compute'].list_volume_attachments),
-            ("Instance Configurations", clients['compute'].list_instance_configurations),
-            ("Instance Pools", clients['compute'].list_instance_pools),
-            ("Dedicated VM Hosts", clients['compute'].list_dedicated_vm_hosts),
-            ("Cluster Networks", clients['compute'].list_cluster_networks),
-            ("Compute Capacity Reports", clients['compute'].list_compute_capacity_reports),
+            # Check if methods exist before adding them
+            ("Instance Configurations", clients['compute'].list_instance_configurations if hasattr(clients['compute'], 'list_instance_configurations') else None),
+            ("Instance Pools", clients['compute'].list_instance_pools if hasattr(clients['compute'], 'list_instance_pools') else None),
+            ("Dedicated VM Hosts", clients['compute'].list_dedicated_vm_hosts if hasattr(clients['compute'], 'list_dedicated_vm_hosts') else None),
+            ("Cluster Networks", clients['compute'].list_cluster_networks if hasattr(clients['compute'], 'list_cluster_networks') else None),
+            ("Compute Capacity Reports", clients['compute'].list_compute_capacity_reports if hasattr(clients['compute'], 'list_compute_capacity_reports') else None),
         ],
         "Block Storage": [
             ("Block Volumes", clients['block_storage'].list_volumes),
             ("Boot Volumes", clients['block_storage'].list_boot_volumes),
             ("Volume Backups", clients['block_storage'].list_volume_backups),
-            ("Volume Groups", clients['block_storage'].list_volume_groups),
-            ("Volume Group Backups", clients['block_storage'].list_volume_group_backups),
+            ("Volume Groups", clients['block_storage'].list_volume_groups if hasattr(clients['block_storage'], 'list_volume_groups') else None),
+            ("Volume Group Backups", clients['block_storage'].list_volume_group_backups if hasattr(clients['block_storage'], 'list_volume_group_backups') else None),
         ],
         "Networking": [
             ("VCNs", clients['network'].list_vcns),
@@ -441,18 +442,18 @@ def define_resource_tasks(clients, compartment_id):
             ("DRGs", clients['network'].list_drgs),
             ("IPSec Connections", clients['network'].list_ip_sec_connections),
             ("Public IPs", clients['network'].list_public_ips),
-            ("VLANs", clients['network'].list_vlans),
-            ("Virtual Circuits", clients['network'].list_virtual_circuits),
+            ("VLANs", clients['network'].list_vlans if hasattr(clients['network'], 'list_vlans') else None),
+            ("Virtual Circuits", clients['network'].list_virtual_circuits if hasattr(clients['network'], 'list_virtual_circuits') else None),
         ],
         "Database": [
             ("DB Systems", clients['database'].list_db_systems),
             ("Autonomous Databases", clients['database'].list_autonomous_databases),
             ("Autonomous Database Backups", clients['database'].list_autonomous_database_backups),
             ("DB Backups", clients['database'].list_backups),
-            ("Exadata Infrastructures", clients['database'].list_exadata_infrastructures),
-            ("Autonomous Container Databases", clients['database'].list_autonomous_container_databases),
-            ("Autonomous VM Clusters", clients['database'].list_autonomous_vm_clusters),
-            ("DB Homes", clients['database'].list_db_homes),
+            ("Exadata Infrastructures", clients['database'].list_exadata_infrastructures if hasattr(clients['database'], 'list_exadata_infrastructures') else None),
+            ("Autonomous Container Databases", clients['database'].list_autonomous_container_databases if hasattr(clients['database'], 'list_autonomous_container_databases') else None),
+            ("Autonomous VM Clusters", clients['database'].list_autonomous_vm_clusters if hasattr(clients['database'], 'list_autonomous_vm_clusters') else None),
+            ("DB Homes", clients['database'].list_db_homes if hasattr(clients['database'], 'list_db_homes') else None),
         ],
         "Object Storage": [
             ("Buckets", clients['object_storage'].get_namespace),
@@ -481,77 +482,78 @@ def define_resource_tasks(clients, compartment_id):
     
     if 'streaming' in clients:
         service_resources["Streaming"] = [
-            ("Stream Pools", clients['streaming'].list_stream_pools),
+            ("Stream Pools", clients['streaming'].list_stream_pools if hasattr(clients['streaming'], 'list_stream_pools') else None),
         ]
     
     if 'analytics' in clients:
         service_resources["Analytics"] = [
-            ("Analytics Instances", clients['analytics'].list_analytics_instances),
+            ("Analytics Instances", clients['analytics'].list_analytics_instances if hasattr(clients['analytics'], 'list_analytics_instances') else None),
         ]
     
     if 'apigateway' in clients:
         service_resources["API Gateway"] = [
-            ("Gateways", clients['apigateway'].list_gateways),
-            ("Deployments", clients['apigateway'].list_deployments),
+            ("Gateways", clients['apigateway'].list_gateways if hasattr(clients['apigateway'], 'list_gateways') else None),
+            ("Deployments", clients['apigateway'].list_deployments if hasattr(clients['apigateway'], 'list_deployments') else None),
         ]
     
     if 'nosql' in clients:
         service_resources["NoSQL"] = [
-            ("Tables", clients['nosql'].list_tables),
+            ("Tables", clients['nosql'].list_tables if hasattr(clients['nosql'], 'list_tables') else None),
         ]
     
     if 'monitoring' in clients:
         service_resources["Monitoring"] = [
-            ("Alarms", clients['monitoring'].list_alarms),
+            ("Alarms", clients['monitoring'].list_alarms if hasattr(clients['monitoring'], 'list_alarms') else None),
         ]
     
     if 'dns' in clients:
         service_resources["DNS"] = [
-            ("Zones", clients['dns'].list_zones),
+            ("Zones", clients['dns'].list_zones if hasattr(clients['dns'], 'list_zones') else None),
         ]
     
     if 'data_science' in clients:
         service_resources["Data Science"] = [
-            ("Projects", clients['data_science'].list_projects),
-            ("Notebook Sessions", clients['data_science'].list_notebook_sessions),
-            ("Models", clients['data_science'].list_models),
+            ("Projects", clients['data_science'].list_projects if hasattr(clients['data_science'], 'list_projects') else None),
+            ("Notebook Sessions", clients['data_science'].list_notebook_sessions if hasattr(clients['data_science'], 'list_notebook_sessions') else None),
+            ("Models", clients['data_science'].list_models if hasattr(clients['data_science'], 'list_models') else None),
         ]
     
     if 'events' in clients:
         service_resources["Events"] = [
-            ("Rules", clients['events'].list_rules),
+            ("Rules", clients['events'].list_rules if hasattr(clients['events'], 'list_rules') else None),
         ]
     
     if 'devops' in clients:
         service_resources["DevOps"] = [
-            ("Projects", clients['devops'].list_projects),
+            ("Projects", clients['devops'].list_projects if hasattr(clients['devops'], 'list_projects') else None),
         ]
     
     if 'budget' in clients:
         service_resources["Budget"] = [
-            ("Budgets", clients['budget'].list_budgets),
+            ("Budgets", clients['budget'].list_budgets if hasattr(clients['budget'], 'list_budgets') else None),
         ]
     
     if 'bastion' in clients:
         service_resources["Bastion"] = [
-            ("Bastions", clients['bastion'].list_bastions),
+            ("Bastions", clients['bastion'].list_bastions if hasattr(clients['bastion'], 'list_bastions') else None),
         ]
     
     if 'email' in clients:
         service_resources["Email"] = [
-            ("Senders", clients['email'].list_senders),
-            ("Suppressions", clients['email'].list_suppressions),
+            ("Senders", clients['email'].list_senders if hasattr(clients['email'], 'list_senders') else None),
+            ("Suppressions", clients['email'].list_suppressions if hasattr(clients['email'], 'list_suppressions') else None),
         ]
     
     if 'data_catalog' in clients:
         service_resources["Data Catalog"] = [
-            ("Catalogs", clients['data_catalog'].list_catalogs),
+            ("Catalogs", clients['data_catalog'].list_catalogs if hasattr(clients['data_catalog'], 'list_catalogs') else None),
         ]
     
     # Create resource tasks from the service_resources map
     for service_name, resources in service_resources.items():
         for resource_type, list_func in resources:
-            resource_tasks.append((service_name, resource_type, list_func, compartment_id))
+            if list_func is not None:  # Only add if the method exists
+                resource_tasks.append((service_name, resource_type, list_func, compartment_id))
     
     # Additional resources that require special handling
     
@@ -578,6 +580,38 @@ def define_resource_tasks(clients, compartment_id):
             print(f"Error listing log groups: {e}")
     
     return resource_tasks
+
+def map_resource_type_to_service(resource_type, clients):
+    """Map an OCI resource type to a service client and method."""
+    # Map of OCI resource types to (service, method) tuples
+    resource_type_map = {
+        "instance": ("Compute", clients['compute'].list_instances),
+        "image": ("Compute", clients['compute'].list_images),
+        "bootvolume": ("Block Storage", clients['block_storage'].list_boot_volumes),
+        "volume": ("Block Storage", clients['block_storage'].list_volumes),
+        "vcn": ("Networking", clients['network'].list_vcns),
+        "subnet": ("Networking", clients['network'].list_subnets),
+        "internetgateway": ("Networking", clients['network'].list_internet_gateways),
+        "natgateway": ("Networking", clients['network'].list_nat_gateways),
+        "servicegateway": ("Networking", clients['network'].list_service_gateways),
+        "routetable": ("Networking", clients['network'].list_route_tables),
+        "securitylist": ("Networking", clients['network'].list_security_lists),
+        "networksecuritygroup": ("Networking", clients['network'].list_network_security_groups),
+        "dbsystem": ("Database", clients['database'].list_db_systems),
+        "autonomousdatabase": ("Database", clients['database'].list_autonomous_databases),
+        "filesystem": ("File Storage", clients['file_storage'].list_file_systems),
+        "mounttarget": ("File Storage", clients['file_storage'].list_mount_targets),
+        "loadbalancer": ("Load Balancer", clients['load_balancer'].list_load_balancers),
+    }
+    
+    # Some resources in OCI include prefixes/namespaces, so check for partial matches
+    resource_type_lower = resource_type.lower()
+    for key, (service, method) in resource_type_map.items():
+        if key in resource_type_lower:
+            return service, method
+    
+    # If no match, return None
+    return None, None
 
 def explore_tenancy(compartment_id, compartment_name, clients, max_workers=10):
     """Explore a compartment to find all resources."""
