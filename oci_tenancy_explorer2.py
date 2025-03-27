@@ -1139,6 +1139,23 @@ def flatten_resources(resources_by_type, compartment_info):
             if 'compartment_name' not in resource:
                 resource['compartment_name'] = compartment_info.get('name', 'Unknown')
                 
+            # Ensure lifecycle state is properly captured
+            if 'lifecycle_state' in resource and resource['lifecycle_state'] == 'N/A':
+                # Check for status field as an alternative
+                if 'status' in resource and resource['status'] != 'N/A':
+                    resource['lifecycle_state'] = resource['status']
+                # For bucket objects
+                elif resource_type == 'buckets' and not resource['lifecycle_state']:
+                    resource['lifecycle_state'] = 'ACTIVE'  # Default for buckets
+                # For IP addresses
+                elif resource_type in ['private_ips', 'public_ips'] and not resource['lifecycle_state']:
+                    if 'is_reserved' in resource and resource['is_reserved']:
+                        resource['lifecycle_state'] = 'RESERVED'
+                    elif 'assigned' in resource and resource['assigned']:
+                        resource['lifecycle_state'] = 'ASSIGNED'
+                    else:
+                        resource['lifecycle_state'] = 'AVAILABLE'
+            
             # Rename fields to match our desired CSV schema
             field_mapping = {
                 'resource_id': 'Resource ID',
@@ -1159,8 +1176,7 @@ def flatten_resources(resources_by_type, compartment_info):
                 'memory': 'Memory',
                 'storage_size': 'Storage Size',
                 'cidr_block': 'CIDR Block',
-                'public_access': 'Public Access',
-                'resource_group': 'Resource Group'
+                'public_access': 'Public Access'
             }
             
             # Create a new resource with the remapped fields
@@ -1173,7 +1189,7 @@ def flatten_resources(resources_by_type, compartment_info):
             
             # Add any remaining fields that aren't in our mapping
             for key, value in resource.items():
-                if key not in field_mapping.keys():
+                if key not in field_mapping.keys() and key not in ['id', 'display_name', 'name', 'resource_group']:
                     mapped_resource[key] = value
             
             flattened.append(mapped_resource)
@@ -1278,15 +1294,12 @@ def main():
     # Flatten resources for CSV output
     flattened_resources = flatten_resources(all_resources_by_type, compartment_info)
     
-    # Define CSV headers - make sure all possible fields are included
+    # Define CSV headers with the correct order
     base_headers = [
         'Compartment Name',
         'Resource Name',
-        'Resource Group',
-        'Compartment ID',
-        'Service',
         'Resource Type',
-        'Resource ID',
+        'Service',
         'Region',
         'Availability Domain',
         'Shape',
@@ -1298,14 +1311,17 @@ def main():
         'Lifecycle State',
         'Time Created',
         'Cross-Compartment References',
+        'Resource ID',
+        'Compartment ID',
         'Defined Tags',
         'Freeform Tags'
     ]
     
-    # Get all field names from all resources
+    # Get all field names from all resources, excluding ones we don't want
     all_fields = set(base_headers)
+    excluded_fields = {'id', 'display_name', 'name', 'resource_group'}
     for resource in flattened_resources:
-        all_fields.update(resource.keys())
+        all_fields.update([k for k in resource.keys() if k not in excluded_fields])
     
     # Final headers: base headers first, then any additional fields sorted alphabetically
     headers = base_headers + sorted(list(all_fields - set(base_headers)))
