@@ -383,7 +383,8 @@ def get_service_clients(config):
         clients['nosql'] = oci.nosql.NosqlClient(config)
         clients['monitoring'] = oci.monitoring.MonitoringClient(config)
         clients['dns'] = oci.dns.DnsClient(config)
-        clients['kms_management'] = oci.key_management.KmsManagementClient(config)
+        # Skip KMS for now - requires service endpoint
+        # clients['kms_management'] = oci.key_management.KmsManagementClient(config)
         clients['logs'] = oci.logging.LoggingManagementClient(config)
         clients['data_science'] = oci.data_science.DataScienceClient(config)
         clients['events'] = oci.events.EventsClient(config)
@@ -554,31 +555,7 @@ def define_resource_tasks(clients, compartment_id):
     
     # Additional resources that require special handling
     
-    # Get KMS Vaults and Keys
-    if 'kms_management' in clients:
-        try:
-            vaults = oci.pagination.list_call_get_all_results(
-                clients['kms_management'].list_vaults,
-                compartment_id=compartment_id
-            ).data
-            
-            for vault in vaults:
-                try:
-                    # Create a vault-specific client with the management endpoint
-                    vault_management_client = oci.key_management.KmsVaultClient(
-                        clients['kms_management'].base_client.config,
-                        vault.management_endpoint
-                    )
-                    
-                    resource_tasks.append(
-                        ("Key Management", f"Keys (Vault: {vault.display_name})",
-                         lambda compartment_id, client=vault_management_client: client.list_keys(compartment_id),
-                         compartment_id)
-                    )
-                except Exception as e:
-                    print(f"Error creating vault client for {vault.display_name}: {e}")
-        except Exception as e:
-            print(f"Error listing vaults: {e}")
+    # Skip KMS for now due to service endpoint requirement
     
     # Get Log Groups and Logs
     if 'logs' in clients:
@@ -610,6 +587,9 @@ def explore_tenancy(compartment_id, compartment_name, clients, max_workers=10):
     # Extract resources in parallel
     all_resources = []
     
+    print(f"\nExploring resources in {compartment_name}...")
+    print(f"Found {len(resource_tasks)} resource types to scan")
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = []
         
@@ -623,13 +603,14 @@ def explore_tenancy(compartment_id, compartment_name, clients, max_workers=10):
                 resources = future.result()
                 completed += 1
                 
-                # Progress update
-                progress = (completed / len(futures)) * 100
-                print(f"[{progress:.1f}%] {service_name} - {resource_type}: {len(resources)} resources found")
+                # More concise progress indicator
+                resource_count = len(resources)
+                print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found")
                 
                 all_resources.extend(resources)
             except Exception as e:
-                print(f"Error processing {service_name} - {resource_type}: {e}")
+                print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: Error - {str(e)[:100]}")
+                completed += 1
     
     return all_resources
 
@@ -706,6 +687,7 @@ def main():
         sys.exit(1)
     
     # Initialize clients
+    print("Initializing OCI clients...")
     clients = get_service_clients(config)
     tenancy_id = config.get('tenancy')
     
@@ -715,15 +697,21 @@ def main():
     print(f"Found compartment: {compartment.name} (ID: {compartment.id})")
     
     compartments_to_scan = []
+    all_compartments = []
+    
     if args.recursive:
         print("Scanning for child compartments...")
+        
+        # Get all compartments first
         all_compartments = get_all_compartments(clients['identity'], tenancy_id)
+        
+        # Build compartment hierarchy
         compartment_hierarchy = build_compartment_hierarchy(clients['identity'], tenancy_id, all_compartments)
         
         # Filter compartments to include target and its children
         compartments_to_scan = [c for c in all_compartments 
                                if c.id == compartment.id or 
-                               (c.compartment_id == compartment.id)]
+                               (hasattr(c, 'compartment_id') and c.compartment_id == compartment.id)]
         
         # Print compartment hierarchy
         print(f"Found {len(compartments_to_scan)} compartments to scan:")
