@@ -1,14 +1,36 @@
 import subprocess
 import json
 import argparse
+import os
+import configparser
 from collections import defaultdict
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Extract and organize OCI policies')
-    parser.add_argument('--tenancy-ocid', required=True, help='The OCID of your tenancy')
+    parser.add_argument('--tenancy-ocid', help='The OCID of your tenancy (optional, will read from config if not provided)')
+    parser.add_argument('--profile', default='DEFAULT', help='OCI config profile to use (default: DEFAULT)')
     return parser.parse_args()
 
-# Output file names
+def get_tenancy_from_config(profile='DEFAULT'):
+    """Read tenancy OCID from OCI config file"""
+    config_file = os.path.expanduser('~/.oci/config')
+    
+    if not os.path.exists(config_file):
+        print(f"OCI config file not found at {config_file}")
+        return None
+    
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    
+    if profile not in config:
+        print(f"Profile '{profile}' not found in OCI config")
+        return None
+    
+    if 'tenancy' in config[profile]:
+        return config[profile]['tenancy']
+    
+    print(f"Tenancy OCID not found in profile '{profile}'")
+    return None# Output file names
 group_file = "policies_by_group.txt"
 target_file = "policies_by_target.txt"
 name_file = "policies_by_name.txt"
@@ -49,7 +71,17 @@ def extract_target_compartment(statement):
 
 def main():
     args = parse_args()
+    
+    # Get tenancy OCID from command line or config file
     tenancy_ocid = args.tenancy_ocid
+    if not tenancy_ocid:
+        tenancy_ocid = get_tenancy_from_config(args.profile)
+        if not tenancy_ocid:
+            print("Error: Tenancy OCID not provided and could not be read from OCI config.")
+            print("Please provide it with --tenancy-ocid or ensure it's in your OCI config file.")
+            exit(1)
+    
+    print(f"Using tenancy OCID: {tenancy_ocid}")
     
     # Get compartments
     compartments_cmd = f"oci iam compartment list --compartment-id {tenancy_ocid} --all --include-root"
@@ -111,8 +143,10 @@ def main():
     if total_group_statements > 0:
         with open(group_file, mode="w", encoding="utf-8") as txtfile:
             max_group_len = max(len(group_name) for group_name in group_statements.keys())
-            max_compartment_len = max(len(stmt[1]) for stmts in group_statements.values() for stmt in stmts)
-            header = f"{'Group Name':<{max_group_len}}, {'Compartment':<{max_compartment_len}}, Policy Statements"
+            max_def_comp_len = max(len(stmt[1]) for stmts in group_statements.values() for stmt in stmts)
+            max_tgt_comp_len = max(len(stmt[2]) for stmts in group_statements.values() for stmt in stmts)
+            
+            header = f"{'Group Name':<{max_group_len}}, {'Definition Compartment':<{max_def_comp_len}}, {'Target Compartment':<{max_tgt_comp_len}}, Policy Statements"
             txtfile.write(header + "\n")
             
             padding = " " * (max_group_len + 2)
@@ -121,11 +155,11 @@ def main():
                 if not first_group:
                     txtfile.write("\n")
                 first_group = False
-                for i, (statement, compartment) in enumerate(statements):
+                for i, (statement, def_comp, tgt_comp) in enumerate(statements):
                     if i == 0:
-                        line = f"{group_name:<{max_group_len}}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{group_name:<{max_group_len}}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     else:
-                        line = f"{padding}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{padding}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     txtfile.write(line + "\n")
     print(f"Total policy statements in {group_file}: {total_group_statements}")
 
@@ -134,8 +168,10 @@ def main():
     if total_target_statements > 0:
         with open(target_file, mode="w", encoding="utf-8") as txtfile:
             max_target_len = max(len(target) for target in target_statements.keys())
-            max_compartment_len = max(len(stmt[1]) for stmts in target_statements.values() for stmt in stmts)
-            header = f"{'Target':<{max_target_len}}, {'Compartment':<{max_compartment_len}}, Policy Statements"
+            max_def_comp_len = max(len(stmt[1]) for stmts in target_statements.values() for stmt in stmts)
+            max_tgt_comp_len = max(len(stmt[2]) for stmts in target_statements.values() for stmt in stmts)
+            
+            header = f"{'Target':<{max_target_len}}, {'Definition Compartment':<{max_def_comp_len}}, {'Target Compartment':<{max_tgt_comp_len}}, Policy Statements"
             txtfile.write(header + "\n")
             
             padding = " " * (max_target_len + 2)
@@ -144,11 +180,11 @@ def main():
                 if not first_target:
                     txtfile.write("\n")
                 first_target = False
-                for i, (statement, compartment) in enumerate(statements):
+                for i, (statement, def_comp, tgt_comp) in enumerate(statements):
                     if i == 0:
-                        line = f"{target:<{max_target_len}}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{target:<{max_target_len}}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     else:
-                        line = f"{padding}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{padding}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     txtfile.write(line + "\n")
     print(f"Total policy statements in {target_file}: {total_target_statements}")
 
@@ -157,8 +193,10 @@ def main():
     if total_name_statements > 0:
         with open(name_file, mode="w", encoding="utf-8") as txtfile:
             max_name_len = max(len(name) for name in name_statements.keys())
-            max_compartment_len = max(len(stmt[1]) for stmts in name_statements.values() for stmt in stmts)
-            header = f"{'Policy Name':<{max_name_len}}, {'Compartment':<{max_compartment_len}}, Policy Statements"
+            max_def_comp_len = max(len(stmt[1]) for stmts in name_statements.values() for stmt in stmts)
+            max_tgt_comp_len = max(len(stmt[2]) for stmts in name_statements.values() for stmt in stmts)
+            
+            header = f"{'Policy Name':<{max_name_len}}, {'Definition Compartment':<{max_def_comp_len}}, {'Target Compartment':<{max_tgt_comp_len}}, Policy Statements"
             txtfile.write(header + "\n")
             
             padding = " " * (max_name_len + 2)
@@ -167,11 +205,11 @@ def main():
                 if not first_name:
                     txtfile.write("\n")
                 first_name = False
-                for i, (statement, compartment) in enumerate(statements):
+                for i, (statement, def_comp, tgt_comp) in enumerate(statements):
                     if i == 0:
-                        line = f"{name:<{max_name_len}}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{name:<{max_name_len}}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     else:
-                        line = f"{padding}, {compartment:<{max_compartment_len}}, {statement}"
+                        line = f"{padding}, {def_comp:<{max_def_comp_len}}, {tgt_comp:<{max_tgt_comp_len}}, {statement}"
                     txtfile.write(line + "\n")
     print(f"Total policy statements in {name_file}: {total_name_statements}")
 
