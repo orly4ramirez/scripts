@@ -5,6 +5,9 @@ OCI Encryption Keys Report Generator
 This script retrieves all encryption keys from OCI vaults,
 along with their properties and associated resources.
 
+Requirements:
+- Python 3.6+
+- OCI Python SDK (pip install oci)
 - Configured OCI config file (~/.oci/config)
 """
 
@@ -82,9 +85,9 @@ def find_compartment_by_name(identity_client, tenancy_id, compartment_name):
     print(f"Error: No compartment found with name '{compartment_name}'")
     return None
 
-def get_vaults_in_compartment(config, compartment_id):
+def get_vaults_in_compartment(config, compartment_id, compartment_name="Unknown compartment"):
     """Retrieve all vaults in a compartment"""
-    print(f"Retrieving vaults in compartment {compartment_id}...")
+    print(f"Retrieving vaults in {compartment_name}...")
     
     try:
         # Create a client for listing vaults
@@ -96,12 +99,12 @@ def get_vaults_in_compartment(config, compartment_id):
         )
         return vaults_response.data
     except Exception as e:
-        print(f"Error retrieving vaults in compartment {compartment_id}: {e}")
+        print(f"Error retrieving vaults in {compartment_name}: {e}")
         return []
 
-def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint):
+def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint, vault_name="Unknown vault"):
     """Retrieve all keys in a vault"""
-    print(f"Retrieving keys in vault {vault_id}...")
+    print(f"Retrieving keys in vault: {vault_name}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
@@ -116,12 +119,12 @@ def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint):
         )
         return keys_response.data
     except Exception as e:
-        print(f"Error retrieving keys in vault {vault_id}: {e}")
+        print(f"Error retrieving keys in vault {vault_name}: {e}")
         return []
 
-def get_key_details(config, key_id, management_endpoint):
+def get_key_details(config, key_id, management_endpoint, key_name="Unknown key"):
     """Retrieve details for a specific key"""
-    print(f"Retrieving details for key {key_id}...")
+    print(f"Retrieving details for key: {key_name}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
@@ -133,12 +136,12 @@ def get_key_details(config, key_id, management_endpoint):
         key_response = vault_client.get_key(key_id)
         return key_response.data
     except Exception as e:
-        print(f"Error retrieving details for key {key_id}: {e}")
+        print(f"Error retrieving details for key {key_name}: {e}")
         return None
 
-def get_key_versions(config, key_id, management_endpoint):
+def get_key_versions(config, key_id, management_endpoint, key_name="Unknown key"):
     """Retrieve versions for a specific key"""
-    print(f"Retrieving versions for key {key_id}...")
+    print(f"Retrieving versions for key: {key_name}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
@@ -153,12 +156,12 @@ def get_key_versions(config, key_id, management_endpoint):
         )
         return versions_response.data
     except Exception as e:
-        print(f"Error retrieving versions for key {key_id}: {e}")
+        print(f"Error retrieving versions for key {key_name}: {e}")
         return []
 
-def find_resources_using_key(search_client, key_id):
+def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
     """Find resources that use a specific key"""
-    print(f"Finding resources that use key {key_id}...")
+    print(f"Finding resources that use key: {key_name}...")
     
     try:
         search_text = f"""
@@ -191,38 +194,44 @@ def find_resources_using_key(search_client, key_id):
         
         return resources
     except Exception as e:
-        print(f"Error finding resources using key {key_id}: {e}")
+        print(f"Error finding resources using key {key_name}: {e}")
         return []
 
 def process_key(key_data, compartment_data, vault_data, config, search_client):
     """Process a single key and collect all its details"""
     try:
         key_id = key_data.id
+        key_name = key_data.display_name
         management_endpoint = vault_data.management_endpoint
         
         # Get key details
         key_details = get_key_details(
             config,
             key_id,
-            management_endpoint
+            management_endpoint,
+            key_name
         )
         
         if not key_details:
-            print(f"No details available for key {key_id}. Skipping.")
+            print(f"No details available for key {key_name}. Skipping.")
             return None
         
         # Get key versions
         key_versions = get_key_versions(
             config,
             key_id,
-            management_endpoint
+            management_endpoint,
+            key_name
         )
         
         # Find resources using this key
         resources_using_key = find_resources_using_key(
             search_client,
-            key_id
+            key_id,
+            key_name
         )
+        
+        print(f"Key {key_name}: Found {len(resources_using_key)} resources using this key")
         
         # Create key entry
         key_entry = {
@@ -239,8 +248,45 @@ def process_key(key_data, compartment_data, vault_data, config, search_client):
         
         return key_entry
     except Exception as e:
-        print(f"Error processing key {key_data.id}: {e}")
+        print(f"Error processing key {key_data.display_name if hasattr(key_data, 'display_name') else key_id}: {e}")
         return None
+
+def safe_parse_datetime(date_string):
+    """Safely parse datetime string with enhanced error handling"""
+    if not date_string:
+        return ""
+    
+    # Trim whitespace and check for empty string
+    date_string = date_string.strip()
+    if not date_string:
+        return ""
+    
+    # List of possible formats to try
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",    # Standard ISO format with microseconds
+        "%Y-%m-%dT%H:%M:%SZ",       # ISO format without microseconds
+        "%Y-%m-%dT%H:%M:%S",        # ISO format without Z
+        "%Y-%m-%d %H:%M:%S",        # Standard datetime format
+        "%Y-%m-%d",                 # Date only
+        "%Y/%m/%d",                 # Date with slashes
+        "%d-%m-%Y",                 # European format
+        "%m/%d/%Y",                 # US format
+        "%b %d, %Y",                # Month abbreviated
+        "%B %d, %Y"                 # Month full name
+    ]
+    
+    # Try each format
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_string, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    
+    # If all parsing attempts fail, return the original string
+    # but truncate if it's too long
+    if len(date_string) > 30:
+        return date_string[:27] + "..."
+    return date_string
 
 def generate_html_report(results, output_file):
     """Generate HTML report from the collected results"""
@@ -263,6 +309,8 @@ def generate_html_report(results, output_file):
             .collapsible { cursor: pointer; background-color: #eee; padding: 10px; border: none; text-align: left; outline: none; width: 100%; }
             .active, .collapsible:hover { background-color: #ccc; }
             .content { padding: 0 18px; display: none; overflow: hidden; background-color: #f1f1f1; }
+            .progress-bar { background-color: #f1f1f1; border-radius: 5px; padding: 3px; margin-top: 10px; }
+            .progress-bar-inner { background-color: #4CAF50; border-radius: 5px; height: 20px; width: 0%; }
         </style>
     </head>
     <body>
@@ -281,7 +329,6 @@ def generate_html_report(results, output_file):
                     <th>Compartment</th>
                     <th>Vault</th>
                     <th>Key Name</th>
-                    <th>Key ID</th>
                     <th>Algorithm</th>
                     <th>Protection Mode</th>
                     <th>Current Version</th>
@@ -296,16 +343,13 @@ def generate_html_report(results, output_file):
         key_details = key_entry.get("key_details", {})
         resource_count = len(key_entry.get("resources_using_key", []))
         
-        created_date = key_details.get("time_created", "")
-        if created_date:
-            created_date = datetime.strptime(created_date, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%Y-%m-%d %H:%M:%S")
+        created_date = safe_parse_datetime(key_details.get("time_created", ""))
         
         html_content += f"""
                 <tr>
                     <td>{key_entry.get("compartment_name", "Unknown")}</td>
                     <td>{key_entry.get("vault_name", "Unknown")}</td>
                     <td>{key_details.get("display_name", "Unknown")}</td>
-                    <td>{key_details.get("id", "Unknown")}</td>
                     <td>{key_details.get("algorithm", "Unknown")}</td>
                     <td>{key_details.get("protection_mode", "Unknown")}</td>
                     <td>{key_details.get("current_key_version", "Unknown")}</td>
@@ -328,9 +372,7 @@ def generate_html_report(results, output_file):
         key_versions = key_entry.get("key_versions", [])
         resources = key_entry.get("resources_using_key", [])
         
-        created_date = key_details.get("time_created", "")
-        if created_date:
-            created_date = datetime.strptime(created_date, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%Y-%m-%d %H:%M:%S")
+        created_date = safe_parse_datetime(key_details.get("time_created", ""))
         
         # Key properties
         html_content += f"""
@@ -338,8 +380,8 @@ def generate_html_report(results, output_file):
                 <h3>Key Properties</h3>
                 <table>
                     <tr><th>Property</th><th>Value</th></tr>
-                    <tr><td>Compartment</td><td>{key_entry.get("compartment_name", "Unknown")} ({key_entry.get("compartment_id", "Unknown")})</td></tr>
-                    <tr><td>Vault</td><td>{key_entry.get("vault_name", "Unknown")} ({key_entry.get("vault_id", "Unknown")})</td></tr>
+                    <tr><td>Compartment</td><td>{key_entry.get("compartment_name", "Unknown")}</td></tr>
+                    <tr><td>Vault</td><td>{key_entry.get("vault_name", "Unknown")}</td></tr>
                     <tr><td>Key Name</td><td>{key_details.get("display_name", "Unknown")}</td></tr>
                     <tr><td>Key ID</td><td>{key_details.get("id", "Unknown")}</td></tr>
                     <tr><td>Algorithm</td><td>{key_details.get("algorithm", "Unknown")}</td></tr>
@@ -347,8 +389,6 @@ def generate_html_report(results, output_file):
                     <tr><td>Current Version</td><td>{key_details.get("current_key_version", "Unknown")}</td></tr>
                     <tr><td>State</td><td>{key_details.get("lifecycle_state", "Unknown")}</td></tr>
                     <tr><td>Created Date</td><td>{created_date}</td></tr>
-                    <tr><td>Crypto Endpoint</td><td>{key_entry.get("vault_crypto_endpoint", "Unknown")}</td></tr>
-                    <tr><td>Management Endpoint</td><td>{key_entry.get("vault_management_endpoint", "Unknown")}</td></tr>
                 </table>
         """
         
@@ -362,21 +402,17 @@ def generate_html_report(results, output_file):
                 <table>
                     <tr>
                         <th>Version</th>
-                        <th>ID</th>
                         <th>State</th>
                         <th>Created</th>
                     </tr>
             """
             
             for version in key_versions:
-                version_created = version.get("time_created", "")
-                if version_created:
-                    version_created = datetime.strptime(version_created, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%Y-%m-%d %H:%M:%S")
+                version_created = safe_parse_datetime(version.get("time_created", ""))
                 
                 html_content += f"""
                     <tr>
                         <td>{version.get("key_version_number", "Unknown")}</td>
-                        <td>{version.get("id", "Unknown")}</td>
                         <td>{version.get("lifecycle_state", "Unknown")}</td>
                         <td>{version_created}</td>
                     </tr>
@@ -401,7 +437,6 @@ def generate_html_report(results, output_file):
                     <tr>
                         <th>Resource Type</th>
                         <th>Name</th>
-                        <th>ID</th>
                     </tr>
             """
             
@@ -410,7 +445,6 @@ def generate_html_report(results, output_file):
                     <tr>
                         <td>{resource.get("resource_type", "Unknown")}</td>
                         <td>{resource.get("display_name", "Unknown")}</td>
-                        <td>{resource.get("identifier", "Unknown")}</td>
                     </tr>
                 """
             
@@ -480,9 +514,7 @@ def generate_csv_report(results, output_file):
             key_details = key_entry.get("key_details", {})
             resource_count = len(key_entry.get("resources_using_key", []))
             
-            created_date = key_details.get("time_created", "")
-            if created_date:
-                created_date = datetime.strptime(created_date, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%Y-%m-%d %H:%M:%S")
+            created_date = safe_parse_datetime(key_details.get("time_created", ""))
             
             writer.writerow([
                 key_entry.get("compartment_name", "Unknown"),
@@ -542,45 +574,86 @@ def main():
     
     # Get tenancy ID from config
     tenancy_id = config.get('tenancy')
+    print(f"Tenancy ID: {tenancy_id}")
     
     # Determine the compartment ID
     compartment_id = None
+    compartment_name = None
     
     # If compartment name is provided, look up its ID
     if args.compartment_name:
-        compartment_id = find_compartment_by_name(identity_client, tenancy_id, args.compartment_name)
+        compartment_name = args.compartment_name
+        print(f"Looking up compartment: {compartment_name}")
+        compartment_id = find_compartment_by_name(identity_client, tenancy_id, compartment_name)
         if not compartment_id:
             print("Error: Could not find compartment by name. Please check the name or use compartment ID instead.")
             sys.exit(1)
+        print(f"Found compartment: {compartment_name} (ID: {compartment_id})")
     else:
         # Use the provided compartment ID or default to tenancy
         compartment_id = args.compartment_id
         if not compartment_id:
             compartment_id = tenancy_id
-            print(f"No compartment specified, using tenancy root compartment: {compartment_id}")
+            print(f"No compartment specified, using root compartment")
     
     # Get all compartments
     compartments = get_all_compartments(identity_client, compartment_id)
     print(f"Found {len(compartments)} compartments")
+    
+    # Progress tracking
+    start_time = time.time()
+    total_vaults = 0
+    processed_vaults = 0
+    total_keys = 0
+    processed_keys = 0
+    
+    # First pass to count total vaults and keys for progress tracking
+    print("\n[1/3] Counting vaults and keys for progress tracking...")
+    for compartment in compartments:
+        vaults = get_vaults_in_compartment(config, compartment.id, compartment.name)
+        total_vaults += len(vaults)
+        
+        for vault in vaults:
+            if not vault.management_endpoint:
+                continue
+                
+            keys = get_keys_in_vault(
+                config,
+                compartment.id,
+                vault.id,
+                vault.management_endpoint,
+                vault.display_name
+            )
+            total_keys += len(keys)
+    
+    print(f"Found {total_vaults} vaults containing {total_keys} keys in total")
     
     # Results array
     results = []
     keys_found = 0
     
     # Collect all keys from all compartments and vaults
+    print("\n[2/3] Retrieving encryption keys and their properties...")
     for compartment in compartments:
-        print(f"Processing compartment: {compartment.name} ({compartment.id})")
+        print(f"\nProcessing compartment: {compartment.name}")
         
         # Get vaults in compartment
-        vaults = get_vaults_in_compartment(config, compartment.id)
-        print(f"Found {len(vaults)} vaults in compartment {compartment.name}")
+        vaults = get_vaults_in_compartment(config, compartment.id, compartment.name)
+        if not vaults:
+            print(f"  No vaults found in {compartment.name}")
+            continue
+            
+        print(f"  Found {len(vaults)} vaults in {compartment.name}")
         
         for vault in vaults:
-            print(f"Processing vault: {vault.display_name} ({vault.id})")
+            processed_vaults += 1
+            vault_progress = (processed_vaults / total_vaults) * 100
+            
+            print(f"  Processing vault: {vault.display_name} ({processed_vaults}/{total_vaults}, {vault_progress:.1f}%)")
             
             # Skip vaults without management endpoint
             if not vault.management_endpoint:
-                print(f"No management endpoint available for vault {vault.display_name}. Skipping.")
+                print(f"    No management endpoint available for vault {vault.display_name}. Skipping.")
                 continue
             
             # Get keys in vault
@@ -588,9 +661,15 @@ def main():
                 config,
                 compartment.id,
                 vault.id,
-                vault.management_endpoint
+                vault.management_endpoint,
+                vault.display_name
             )
-            print(f"Found {len(keys)} keys in vault {vault.display_name}")
+            
+            if not keys:
+                print(f"    No keys found in vault {vault.display_name}")
+                continue
+                
+            print(f"    Found {len(keys)} keys in vault {vault.display_name}")
             
             # Process each key using thread pool for better performance
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
@@ -612,29 +691,46 @@ def main():
                         if key_entry:
                             results.append(key_entry)
                             keys_found += 1
-                            print(f"Processed {keys_found} keys so far...")
+                            processed_keys += 1
+                            key_progress = (processed_keys / total_keys) * 100
+                            
+                            elapsed_time = time.time() - start_time
+                            estimated_total_time = (elapsed_time / processed_keys) * total_keys if processed_keys > 0 else 0
+                            estimated_remaining_time = estimated_total_time - elapsed_time if estimated_total_time > 0 else 0
+                            
+                            print(f"    Processed key {processed_keys}/{total_keys} ({key_progress:.1f}%) - ETA: {estimated_remaining_time:.0f}s remaining")
                             
                             # Save intermediate results
                             with open(json_output, 'w') as f:
                                 json.dump(results, f, indent=2)
                     except Exception as e:
-                        print(f"Error processing key {key_id}: {e}")
+                        print(f"    Error processing key {key_id}: {e}")
+    
+    # Generate reports
+    print(f"\n[3/3] Generating reports...")
     
     # Save final results
-    print(f"Writing results to {json_output}")
+    print(f"  Writing JSON report to {json_output}")
     with open(json_output, 'w') as f:
         json.dump(results, f, indent=2)
     
     # Generate CSV report
+    print(f"  Generating CSV report")
     generate_csv_report(results, csv_output)
     
     # Generate HTML report
+    print(f"  Generating HTML report")
     generate_html_report(results, html_output)
     
-    print(f"Successfully processed {keys_found} encryption keys")
-    print(f"JSON report: {json_output}")
-    print(f"CSV report: {csv_output}")
-    print(f"HTML report: {html_output}")
+    # Summary
+    total_time = time.time() - start_time
+    print(f"\nSummary:")
+    print(f"  Successfully processed {keys_found} encryption keys across {total_vaults} vaults")
+    print(f"  Total execution time: {total_time:.1f} seconds")
+    print(f"  Reports generated:")
+    print(f"    - JSON: {json_output}")
+    print(f"    - CSV: {csv_output}")
+    print(f"    - HTML: {html_output}")
     print("Done!")
 
 if __name__ == "__main__":
