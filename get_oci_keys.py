@@ -161,7 +161,7 @@ def get_key_versions(config, key_id, management_endpoint, key_name="Unknown key"
 
 def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
     """Find resources that use a specific key"""
-    print(f"Finding resources that use key: {key_name}...")
+    print(f"Finding resources for key: {key_name}...")
     
     try:
         search_text = f"""
@@ -194,7 +194,8 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
         
         return resources
     except Exception as e:
-        print(f"Error finding resources using key {key_name}: {e}")
+        # Simplified error message
+        print(f"Error finding resources for key {key_name}. Check permissions.")
         return []
 
 def process_key(key_data, compartment_data, vault_data, config, search_client):
