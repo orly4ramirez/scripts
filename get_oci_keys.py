@@ -48,13 +48,17 @@ def get_all_compartments(identity_client, compartment_id):
         print(f"Error retrieving compartments: {e}")
         return []
 
-def get_vaults_in_compartment(kms_management_client, compartment_id):
+def get_vaults_in_compartment(identity_client, config, compartment_id):
     """Retrieve all vaults in a compartment"""
     print(f"Retrieving vaults in compartment {compartment_id}...")
     
     try:
+        # Create a KMS Management client with a default endpoint
+        # This is just to get a client for the list_vaults call, which doesn't use the service endpoint
+        kms_vaults_client = oci.key_management.KmsVaultClient(config)
+        
         vaults_response = oci.pagination.list_call_get_all_results(
-            kms_management_client.list_vaults,
+            kms_vaults_client.list_vaults,
             compartment_id
         )
         return vaults_response.data
@@ -62,15 +66,15 @@ def get_vaults_in_compartment(kms_management_client, compartment_id):
         print(f"Error retrieving vaults in compartment {compartment_id}: {e}")
         return []
 
-def get_keys_in_vault(kms_management_client, compartment_id, vault_id, management_endpoint):
+def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint):
     """Retrieve all keys in a vault"""
     print(f"Retrieving keys in vault {vault_id}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
-            kms_management_client.base_client.config,
-            management_endpoint
+            config,
+            service_endpoint=management_endpoint
         )
         
         keys_response = oci.pagination.list_call_get_all_results(
@@ -82,15 +86,15 @@ def get_keys_in_vault(kms_management_client, compartment_id, vault_id, managemen
         print(f"Error retrieving keys in vault {vault_id}: {e}")
         return []
 
-def get_key_details(kms_management_client, key_id, management_endpoint):
+def get_key_details(config, key_id, management_endpoint):
     """Retrieve details for a specific key"""
     print(f"Retrieving details for key {key_id}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
-            kms_management_client.base_client.config,
-            management_endpoint
+            config,
+            service_endpoint=management_endpoint
         )
         
         key_response = vault_client.get_key(key_id)
@@ -99,15 +103,15 @@ def get_key_details(kms_management_client, key_id, management_endpoint):
         print(f"Error retrieving details for key {key_id}: {e}")
         return None
 
-def get_key_versions(kms_management_client, key_id, management_endpoint):
+def get_key_versions(config, key_id, management_endpoint):
     """Retrieve versions for a specific key"""
     print(f"Retrieving versions for key {key_id}...")
     
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
-            kms_management_client.base_client.config,
-            management_endpoint
+            config,
+            service_endpoint=management_endpoint
         )
         
         versions_response = oci.pagination.list_call_get_all_results(
@@ -157,7 +161,7 @@ def find_resources_using_key(search_client, key_id):
         print(f"Error finding resources using key {key_id}: {e}")
         return []
 
-def process_key(key_data, compartment_data, vault_data, clients_data):
+def process_key(key_data, compartment_data, vault_data, config, search_client):
     """Process a single key and collect all its details"""
     try:
         key_id = key_data.id
@@ -165,7 +169,7 @@ def process_key(key_data, compartment_data, vault_data, clients_data):
         
         # Get key details
         key_details = get_key_details(
-            clients_data["kms_management_client"],
+            config,
             key_id,
             management_endpoint
         )
@@ -176,14 +180,14 @@ def process_key(key_data, compartment_data, vault_data, clients_data):
         
         # Get key versions
         key_versions = get_key_versions(
-            clients_data["kms_management_client"],
+            config,
             key_id,
             management_endpoint
         )
         
         # Find resources using this key
         resources_using_key = find_resources_using_key(
-            clients_data["search_client"],
+            search_client,
             key_id
         )
         
@@ -569,7 +573,7 @@ def main():
         print(f"Processing compartment: {compartment.name} ({compartment.id})")
         
         # Get vaults in compartment
-        vaults = get_vaults_in_compartment(kms_management_client, compartment.id)
+        vaults = get_vaults_in_compartment(identity_client, config, compartment.id)
         print(f"Found {len(vaults)} vaults in compartment {compartment.name}")
         
         for vault in vaults:
@@ -582,7 +586,7 @@ def main():
             
             # Get keys in vault
             keys = get_keys_in_vault(
-                kms_management_client,
+                config,
                 compartment.id,
                 vault.id,
                 vault.management_endpoint
@@ -590,11 +594,6 @@ def main():
             print(f"Found {len(keys)} keys in vault {vault.display_name}")
             
             # Process each key using thread pool for better performance
-            clients_data = {
-                "kms_management_client": kms_management_client,
-                "search_client": search_client
-            }
-            
             with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
                 futures = {
                     executor.submit(
@@ -602,7 +601,8 @@ def main():
                         key, 
                         compartment, 
                         vault,
-                        clients_data
+                        config,
+                        search_client
                     ): key.id for key in keys
                 }
                 
