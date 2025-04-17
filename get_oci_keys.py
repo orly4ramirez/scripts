@@ -192,10 +192,20 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
             if key_id in resource_json:
                 resources.append(item)
         
+        if not resources:
+            print(f"No resources found using key '{key_name}'. This could mean:")
+            print(f"  - The key is not currently in use")
+            print(f"  - Resources are in compartments not included in search")
+            print(f"  - Search permissions are insufficient")
+        
         return resources
     except Exception as e:
-        # Simplified error message
-        print(f"Error finding resources for key {key_name}. Check permissions.")
+        error_msg = str(e).lower()
+        if "permission" in error_msg or "auth" in error_msg or "not authorized" in error_msg:
+            print(f"Permission error searching for resources using key '{key_name}'.")
+            print(f"Need: resource-search:search-resources permission.")
+        else:
+            print(f"Error finding resources for key '{key_name}': {e}")
         return []
 
 def process_key(key_data, compartment_data, vault_data, config, search_client):
