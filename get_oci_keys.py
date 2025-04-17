@@ -5,9 +5,6 @@ OCI Encryption Keys Report Generator
 This script retrieves all encryption keys from OCI vaults,
 along with their properties and associated resources.
 
-Requirements:
-- Python 3.6+
-- OCI Python SDK (pip install oci)
 - Configured OCI config file (~/.oci/config)
 """
 
@@ -48,17 +45,53 @@ def get_all_compartments(identity_client, compartment_id):
         print(f"Error retrieving compartments: {e}")
         return []
 
-def get_vaults_in_compartment(identity_client, config, compartment_id):
+def find_compartment_by_name(identity_client, tenancy_id, compartment_name):
+    """Find a compartment by its name and return its OCID"""
+    print(f"Looking up compartment with name: {compartment_name}")
+    
+    # List all compartments in the tenancy
+    compartments = []
+    try:
+        compartments_response = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            tenancy_id,
+            compartment_id_in_subtree=True,
+            lifecycle_state="ACTIVE"
+        )
+        compartments = compartments_response.data
+        
+        # Also check the root compartment
+        try:
+            root_compartment = identity_client.get_compartment(tenancy_id).data
+            if root_compartment.name.lower() == compartment_name.lower():
+                return root_compartment.id
+            compartments.append(root_compartment)
+        except Exception as e:
+            print(f"Warning: Error retrieving root compartment: {e}")
+    
+    except Exception as e:
+        print(f"Error looking up compartments: {e}")
+        return None
+    
+    # Search for the compartment by name (case-insensitive)
+    for compartment in compartments:
+        if compartment.name.lower() == compartment_name.lower():
+            print(f"Found compartment: {compartment.name} (ID: {compartment.id})")
+            return compartment.id
+    
+    print(f"Error: No compartment found with name '{compartment_name}'")
+    return None
+
+def get_vaults_in_compartment(config, compartment_id):
     """Retrieve all vaults in a compartment"""
     print(f"Retrieving vaults in compartment {compartment_id}...")
     
     try:
-        # Create a KMS Management client with a default endpoint
-        # This is just to get a client for the list_vaults call, which doesn't use the service endpoint
-        kms_vaults_client = oci.key_management.KmsVaultClient(config)
+        # Create a client for listing vaults
+        vault_client = oci.key_management.KmsVaultClient(config)
         
         vaults_response = oci.pagination.list_call_get_all_results(
-            kms_vaults_client.list_vaults,
+            vault_client.list_vaults,
             compartment_id
         )
         return vaults_response.data
@@ -295,6 +328,10 @@ def generate_html_report(results, output_file):
         key_versions = key_entry.get("key_versions", [])
         resources = key_entry.get("resources_using_key", [])
         
+        created_date = key_details.get("time_created", "")
+        if created_date:
+            created_date = datetime.strptime(created_date, "%Y-%m-%dT%H:%M:%S.%fZ").strftime("%Y-%m-%d %H:%M:%S")
+        
         # Key properties
         html_content += f"""
             <div id="key-detail-{i}" class="content">
@@ -462,43 +499,6 @@ def generate_csv_report(results, output_file):
     
     print(f"CSV report generated: {output_file}")
 
-def find_compartment_by_name(identity_client, tenancy_id, compartment_name):
-    """Find a compartment by its name and return its OCID"""
-    print(f"Looking up compartment with name: {compartment_name}")
-    
-    # List all compartments in the tenancy
-    compartments = []
-    try:
-        compartments_response = oci.pagination.list_call_get_all_results(
-            identity_client.list_compartments,
-            tenancy_id,
-            compartment_id_in_subtree=True,
-            lifecycle_state="ACTIVE"
-        )
-        compartments = compartments_response.data
-        
-        # Also check the root compartment
-        try:
-            root_compartment = identity_client.get_compartment(tenancy_id).data
-            if root_compartment.name.lower() == compartment_name.lower():
-                return root_compartment.id
-            compartments.append(root_compartment)
-        except Exception as e:
-            print(f"Warning: Error retrieving root compartment: {e}")
-    
-    except Exception as e:
-        print(f"Error looking up compartments: {e}")
-        return None
-    
-    # Search for the compartment by name (case-insensitive)
-    for compartment in compartments:
-        if compartment.name.lower() == compartment_name.lower():
-            print(f"Found compartment: {compartment.name} (ID: {compartment.id})")
-            return compartment.id
-    
-    print(f"Error: No compartment found with name '{compartment_name}'")
-    return None
-
 def main():
     parser = argparse.ArgumentParser(description='OCI Encryption Keys Report Generator')
     parser.add_argument('--compartment-id', help='OCID of the compartment to search (default: root compartment)')
@@ -531,7 +531,6 @@ def main():
     try:
         config = oci.config.from_file(config_file, args.profile)
         identity_client = oci.identity.IdentityClient(config)
-        kms_management_client = oci.key_management.KmsManagementClient(config)
         search_client = oci.resource_search.ResourceSearchClient(config)
         
         # Test the connection
@@ -573,7 +572,7 @@ def main():
         print(f"Processing compartment: {compartment.name} ({compartment.id})")
         
         # Get vaults in compartment
-        vaults = get_vaults_in_compartment(identity_client, config, compartment.id)
+        vaults = get_vaults_in_compartment(config, compartment.id)
         print(f"Found {len(vaults)} vaults in compartment {compartment.name}")
         
         for vault in vaults:
