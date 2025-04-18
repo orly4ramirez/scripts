@@ -302,9 +302,8 @@ def generate_csv_report(results, output_file):
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
         
-        # Write header with added report date column
+        # Write header with resource information columns
         writer.writerow([
-            "Report Date",
             "Compartment Name", 
             "Vault Name", 
             "Key Name", 
@@ -313,19 +312,22 @@ def generate_csv_report(results, output_file):
             "Protection Mode", 
             "Current Key Version", 
             "State", 
-            "Created Date", 
-            "Resources Using Key"
+            "Key Created Date",
+            "Resource Type",
+            "Resource Name",
+            "Resource ID",
+            "Resource State"
         ])
         
-        # Write data
+        # Write data with resource details
         for key_entry in results:
             key_details = key_entry.get("key_details", {})
-            resource_count = len(key_entry.get("resources_using_key", []))
+            resources = key_entry.get("resources_using_key", [])
             
             created_date = safe_parse_datetime(key_details.get("time_created", ""))
             
-            writer.writerow([
-                report_date,
+            # Common key information
+            key_info = [
                 key_entry.get("compartment_name", "Unknown"),
                 key_entry.get("vault_name", "Unknown"),
                 key_details.get("display_name", "Unknown"),
@@ -334,9 +336,21 @@ def generate_csv_report(results, output_file):
                 key_details.get("protection_mode", "Unknown"),
                 key_details.get("current_key_version", "Unknown"),
                 key_details.get("lifecycle_state", "Unknown"),
-                created_date,
-                resource_count
-            ])
+                created_date
+            ]
+            
+            # If no resources found, write one row with empty resource fields
+            if not resources:
+                writer.writerow(key_info + ["No resources", "", "", ""])
+            else:
+                # Write a row for each resource using this key
+                for resource in resources:
+                    resource_type = resource.get("resource_type", "Unknown")
+                    resource_name = resource.get("display_name", "No name")
+                    resource_id = resource.get("identifier", "Unknown")
+                    resource_state = resource.get("lifecycle_state", "Unknown")
+                    
+                    writer.writerow(key_info + [resource_type, resource_name, resource_id, resource_state])
     
     print(f"CSV report generated: {output_file}")
 
@@ -346,7 +360,7 @@ def main():
     parser.add_argument('--compartment-name', help='Name of the compartment to search (alternative to compartment-id)')
     parser.add_argument('--config-file', default='~/.oci/config', help='Path to OCI config file')
     parser.add_argument('--profile', default='DEFAULT', help='OCI config profile to use')
-    parser.add_argument('--output-file', default='./oci_encryption_keys_report.csv', help='Output CSV file path')
+    parser.add_argument('--output-file', help='Output CSV file path (default: auto-generated with date suffix)')
     parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of worker threads')
     parser.add_argument('--quiet', action='store_true', help='Minimize output messages')
     args = parser.parse_args()
@@ -355,6 +369,11 @@ def main():
     def log_message(msg):
         if not args.quiet:
             print(msg)
+    
+    # Generate default output filename with date suffix if not specified
+    if not args.output_file:
+        date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_file = f"./oci_encryption_keys_report_{date_suffix}.csv"
     
     # Expand user directory
     config_file = os.path.expanduser(args.config_file)
@@ -369,6 +388,7 @@ def main():
     log_message(f"Using config file: {config_file}")
     log_message(f"Using profile: {args.profile}")
     log_message(f"Output file will be saved to: {output_file}")
+
     
     # Initialize OCI clients
     try:
