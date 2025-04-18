@@ -233,19 +233,11 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
                 resources.append(item)
         
         if not resources:
-            print(f"No resources found using key '{key_name}'. This could mean:")
-            print(f"  - The key is not currently in use")
-            print(f"  - Resources are in compartments not included in search")
-            print(f"  - Search permissions are insufficient")
+            print(f"No resources using key '{key_name}'")
         
         return resources
     except Exception as e:
-        error_msg = str(e).lower()
-        if "permission" in error_msg or "auth" in error_msg or "not authorized" in error_msg:
-            print(f"Permission error searching for resources using key '{key_name}'.")
-            print(f"Need: resource-search:search-resources permission.")
-        else:
-            print(f"Error finding resources for key '{key_name}': {e}")
+        print(f"Error accessing resources for key '{key_name}'")
         return []
 
 def process_key(key_data, compartment_data, vault_data, config, search_client):
@@ -304,11 +296,15 @@ def process_key(key_data, compartment_data, vault_data, config, search_client):
 
 def generate_csv_report(results, output_file):
     """Generate CSV report from the collected results"""
+    # Get current date and time for the report
+    report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
         
-        # Write header
+        # Write header with added report date column
         writer.writerow([
+            "Report Date",
             "Compartment Name", 
             "Vault Name", 
             "Key Name", 
@@ -329,6 +325,7 @@ def generate_csv_report(results, output_file):
             created_date = safe_parse_datetime(key_details.get("time_created", ""))
             
             writer.writerow([
+                report_date,
                 key_entry.get("compartment_name", "Unknown"),
                 key_entry.get("vault_name", "Unknown"),
                 key_details.get("display_name", "Unknown"),
