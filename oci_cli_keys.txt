@@ -1,0 +1,22 @@
+Minimum Required Permissions
+inspect vaults in compartment <compartment-name>
+manage keys in compartment <compartment-name>
+read resource-types in tenancy
+use resource-search in tenancy
+read all-resources in compartment <compartment-name>
+
+
+1. List all encrypted volumes:
+oci bv volume list --compartment-id <compartment-id> --all --query "data[?\"is-encrypted\" == `true`]"
+
+2. List all encryption keys in a vault:
+oci kms management key list --compartment-id <compartment-id> --endpoint <vault-management-endpoint>
+
+3. Check for resources using a specific key:
+oci search resource structured-search --query-text "query all resources where (isEncrypted = 'true')"
+
+4. Verify your permissions:
+oci iam policy list --compartment-id <compartment-id> --query "data[*].statements"
+
+5. Check which resources are using a specific key:
+oci bv boot-volume-kms-key get --boot-volume-id <boot-volume-id>
