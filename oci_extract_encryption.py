@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-OCI Encryption Keys CSV Generator
----------------------------------
-This script retrieves all encryption keys from OCI vaults and outputs
-a single CSV file with key properties and resource usage.
+OCI Encryption Keys Multi-Region CSV Generator
+----------------------------------------------
+This script retrieves all encryption keys from OCI vaults across multiple regions
+and outputs a single CSV file with key properties and resource usage.
 
 Requirements:
 - Python 3.6+
@@ -16,9 +16,13 @@ import csv
 import argparse
 import os
 import sys
+import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+
+# Default regions to scan
+DEFAULT_REGIONS = ['us-ashburn-1', 'us-phoenix-1']
 
 def safe_parse_datetime(date_string):
     """Safely parse datetime string with enhanced error handling"""
@@ -59,8 +63,6 @@ def safe_parse_datetime(date_string):
 
 def get_all_compartments(identity_client, compartment_id):
     """Retrieve all compartments in the tenancy recursively"""
-    print("Retrieving all compartments...")
-    
     try:
         compartments = []
         list_compartments_response = oci.pagination.list_call_get_all_results(
@@ -123,8 +125,6 @@ def find_compartment_by_name(identity_client, tenancy_id, compartment_name):
 
 def get_vaults_in_compartment(config, compartment_id, compartment_name="Unknown compartment"):
     """Retrieve all vaults in a compartment"""
-    print(f"Retrieving vaults in {compartment_name}...")
-    
     try:
         # Create a client for listing vaults
         vault_client = oci.key_management.KmsVaultClient(config)
@@ -141,8 +141,6 @@ def get_vaults_in_compartment(config, compartment_id, compartment_name="Unknown 
 
 def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint, vault_name="Unknown vault"):
     """Retrieve all keys in a vault"""
-    print(f"Retrieving keys in vault: {vault_name}...")
-    
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
@@ -162,8 +160,6 @@ def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint, vau
 
 def get_key_details(config, key_id, management_endpoint, key_name="Unknown key"):
     """Retrieve details for a specific key"""
-    print(f"Retrieving details for key: {key_name}...")
-    
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
@@ -180,8 +176,6 @@ def get_key_details(config, key_id, management_endpoint, key_name="Unknown key")
 
 def get_key_versions(config, key_id, management_endpoint, key_name="Unknown key"):
     """Retrieve versions for a specific key"""
-    print(f"Retrieving versions for key: {key_name}...")
-    
     try:
         # Create a new client specific to this vault's management endpoint
         vault_client = oci.key_management.KmsManagementClient(
@@ -201,8 +195,6 @@ def get_key_versions(config, key_id, management_endpoint, key_name="Unknown key"
 
 def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
     """Find resources that use a specific key"""
-    print(f"Finding resources for key: {key_name}...")
-    
     try:
         search_text = f"""
             query all resources
@@ -240,7 +232,7 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
         print(f"Error accessing resources for key '{key_name}'")
         return []
 
-def process_key(key_data, compartment_data, vault_data, config, search_client):
+def process_key(region, key_data, compartment_data, vault_data, config, search_client):
     """Process a single key and collect all its details"""
     try:
         key_id = key_data.id
@@ -278,6 +270,7 @@ def process_key(key_data, compartment_data, vault_data, config, search_client):
         
         # Create key entry
         key_entry = {
+            "region": region,
             "compartment_id": compartment_data.id,
             "compartment_name": compartment_data.name,
             "vault_id": vault_data.id,
@@ -296,14 +289,12 @@ def process_key(key_data, compartment_data, vault_data, config, search_client):
 
 def generate_csv_report(results, output_file):
     """Generate CSV report from the collected results"""
-    # Get current date and time for the report
-    report_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
     with open(output_file, 'w', newline='') as f:
         writer = csv.writer(f)
         
         # Write header with resource information columns
         writer.writerow([
+            "Region",
             "Compartment Name", 
             "Vault Name", 
             "Key Name", 
@@ -328,6 +319,7 @@ def generate_csv_report(results, output_file):
             
             # Common key information
             key_info = [
+                key_entry.get("region", "Unknown"),
                 key_entry.get("compartment_name", "Unknown"),
                 key_entry.get("vault_name", "Unknown"),
                 key_details.get("display_name", "Unknown"),
@@ -354,12 +346,117 @@ def generate_csv_report(results, output_file):
     
     print(f"CSV report generated: {output_file}")
 
+def process_region(region, config, compartment_id, max_workers, quiet):
+    """Process a single region and return results"""
+    # Copy config and update the region
+    region_config = config.copy()
+    region_config["region"] = region
+    
+    # Setup logging based on quiet mode
+    def log_message(msg):
+        if not quiet:
+            print(f"[{region}] {msg}")
+    
+    # Initialize OCI clients for this region
+    try:
+        identity_client = oci.identity.IdentityClient(region_config)
+        search_client = oci.resource_search.ResourceSearchClient(region_config)
+        
+        # Test the connection
+        identity_client.list_regions()
+    except Exception as e:
+        print(f"[{region}] Error initializing OCI clients: {e}")
+        print(f"[{region}] Skipping region.")
+        return []
+    
+    # Get all compartments
+    compartments = get_all_compartments(identity_client, compartment_id)
+    log_message(f"Found {len(compartments)} compartments")
+    
+    # Results array for this region
+    results = []
+    
+    # Track vaults and keys for progress reporting
+    total_vaults = 0
+    processed_vaults = 0
+    
+    # First count vaults
+    for compartment in compartments:
+        vaults = get_vaults_in_compartment(region_config, compartment.id, compartment.name)
+        total_vaults += len(vaults)
+    
+    log_message(f"Found {total_vaults} vaults")
+    
+    # Process each compartment
+    for compartment in compartments:
+        log_message(f"Processing compartment: {compartment.name}")
+        
+        # Get vaults in compartment
+        vaults = get_vaults_in_compartment(region_config, compartment.id, compartment.name)
+        if not vaults:
+            log_message(f"  No vaults found in {compartment.name}")
+            continue
+            
+        log_message(f"  Found {len(vaults)} vaults in {compartment.name}")
+        
+        for vault in vaults:
+            processed_vaults += 1
+            vault_progress = (processed_vaults / total_vaults) * 100 if total_vaults > 0 else 0
+            
+            log_message(f"  Processing vault: {vault.display_name} ({processed_vaults}/{total_vaults}, {vault_progress:.1f}%)")
+            
+            # Skip vaults without management endpoint
+            if not vault.management_endpoint:
+                log_message(f"    No management endpoint available for vault {vault.display_name}. Skipping.")
+                continue
+            
+            # Get keys in vault
+            keys = get_keys_in_vault(
+                region_config,
+                compartment.id,
+                vault.id,
+                vault.management_endpoint,
+                vault.display_name
+            )
+            
+            if not keys:
+                log_message(f"    No keys found in vault {vault.display_name}")
+                continue
+                
+            log_message(f"    Found {len(keys)} keys in vault {vault.display_name}")
+            
+            # Process each key using thread pool for better performance
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_key, 
+                        region,
+                        key, 
+                        compartment, 
+                        vault,
+                        region_config,
+                        search_client
+                    ): key.id for key in keys
+                }
+                
+                for future in as_completed(futures):
+                    key_id = futures[future]
+                    try:
+                        key_entry = future.result()
+                        if key_entry:
+                            results.append(key_entry)
+                    except Exception as e:
+                        print(f"    Error processing key {key_id}: {e}")
+    
+    return results
+
 def main():
-    parser = argparse.ArgumentParser(description='OCI Encryption Keys CSV Generator')
+    parser = argparse.ArgumentParser(description='OCI Encryption Keys Multi-Region CSV Generator')
     parser.add_argument('--compartment-id', help='OCID of the compartment to search (default: root compartment)')
     parser.add_argument('--compartment-name', help='Name of the compartment to search (alternative to compartment-id)')
     parser.add_argument('--config-file', default='~/.oci/config', help='Path to OCI config file')
     parser.add_argument('--profile', default='DEFAULT', help='OCI config profile to use')
+    parser.add_argument('--regions', help='Comma-separated list of regions to scan (default: us-ashburn-1,us-phoenix-1)')
     parser.add_argument('--output-file', help='Output CSV file path (default: auto-generated with date suffix)')
     parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of worker threads')
     parser.add_argument('--quiet', action='store_true', help='Minimize output messages')
@@ -384,22 +481,23 @@ def main():
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
     
-    log_message(f"Starting OCI Encryption Keys CSV generator...")
+    # Set regions to scan
+    if args.regions:
+        regions_to_scan = [r.strip() for r in args.regions.split(',')]
+    else:
+        regions_to_scan = DEFAULT_REGIONS
+    
+    log_message(f"Starting OCI Encryption Keys Multi-Region CSV generator...")
     log_message(f"Using config file: {config_file}")
     log_message(f"Using profile: {args.profile}")
+    log_message(f"Scanning regions: {', '.join(regions_to_scan)}")
     log_message(f"Output file will be saved to: {output_file}")
-
     
-    # Initialize OCI clients
+    # Load OCI config
     try:
         config = oci.config.from_file(config_file, args.profile)
-        identity_client = oci.identity.IdentityClient(config)
-        search_client = oci.resource_search.ResourceSearchClient(config)
-        
-        # Test the connection
-        identity_client.list_regions()
     except Exception as e:
-        print(f"Error initializing OCI clients: {e}")
+        print(f"Error loading OCI configuration: {e}")
         print("Please check your OCI configuration and permissions.")
         sys.exit(1)
     
@@ -415,6 +513,12 @@ def main():
     if args.compartment_name:
         compartment_name = args.compartment_name
         log_message(f"Looking up compartment: {compartment_name}")
+        
+        # Need to create a client with a valid region first
+        temp_config = config.copy()
+        temp_config["region"] = regions_to_scan[0]
+        identity_client = oci.identity.IdentityClient(temp_config)
+        
         compartment_id = find_compartment_by_name(identity_client, tenancy_id, compartment_name)
         if not compartment_id:
             print("Error: Could not find compartment by name. Please check the name or use compartment ID instead.")
@@ -427,124 +531,38 @@ def main():
             compartment_id = tenancy_id
             log_message(f"No compartment specified, using root compartment")
     
-    # Get all compartments
-    compartments = get_all_compartments(identity_client, compartment_id)
-    log_message(f"Found {len(compartments)} compartments")
-    
-    # Progress tracking
+    # Process each region
     start_time = time.time()
-    total_vaults = 0
-    processed_vaults = 0
-    total_keys = 0
-    processed_keys = 0
+    combined_results = []
     
-    # First pass to count total vaults and keys for progress tracking
-    log_message("\n[1/2] Counting vaults and keys for progress tracking...")
-    for compartment in compartments:
-        vaults = get_vaults_in_compartment(config, compartment.id, compartment.name)
-        total_vaults += len(vaults)
+    for region in regions_to_scan:
+        log_message(f"\nProcessing region: {region}")
+        region_start_time = time.time()
         
-        for vault in vaults:
-            if not vault.management_endpoint:
-                continue
-                
-            keys = get_keys_in_vault(
-                config,
-                compartment.id,
-                vault.id,
-                vault.management_endpoint,
-                vault.display_name
-            )
-            total_keys += len(keys)
-    
-    log_message(f"Found {total_vaults} vaults containing {total_keys} keys in total")
-    
-    # Results array
-    results = []
-    keys_found = 0
-    
-    # Collect all keys from all compartments and vaults
-    log_message("\n[2/2] Retrieving encryption keys and their properties...")
-    for compartment in compartments:
-        log_message(f"\nProcessing compartment: {compartment.name}")
+        region_results = process_region(
+            region,
+            config,
+            compartment_id,
+            args.max_workers,
+            args.quiet
+        )
         
-        # Get vaults in compartment
-        vaults = get_vaults_in_compartment(config, compartment.id, compartment.name)
-        if not vaults:
-            log_message(f"  No vaults found in {compartment.name}")
-            continue
-            
-        log_message(f"  Found {len(vaults)} vaults in {compartment.name}")
+        region_time = time.time() - region_start_time
+        log_message(f"Completed region {region}: Found {len(region_results)} keys in {region_time:.1f} seconds")
         
-        for vault in vaults:
-            processed_vaults += 1
-            vault_progress = (processed_vaults / total_vaults) * 100
-            
-            log_message(f"  Processing vault: {vault.display_name} ({processed_vaults}/{total_vaults}, {vault_progress:.1f}%)")
-            
-            # Skip vaults without management endpoint
-            if not vault.management_endpoint:
-                log_message(f"    No management endpoint available for vault {vault.display_name}. Skipping.")
-                continue
-            
-            # Get keys in vault
-            keys = get_keys_in_vault(
-                config,
-                compartment.id,
-                vault.id,
-                vault.management_endpoint,
-                vault.display_name
-            )
-            
-            if not keys:
-                log_message(f"    No keys found in vault {vault.display_name}")
-                continue
-                
-            log_message(f"    Found {len(keys)} keys in vault {vault.display_name}")
-            
-            # Process each key using thread pool for better performance
-            with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-                futures = {
-                    executor.submit(
-                        process_key, 
-                        key, 
-                        compartment, 
-                        vault,
-                        config,
-                        search_client
-                    ): key.id for key in keys
-                }
-                
-                for future in as_completed(futures):
-                    key_id = futures[future]
-                    try:
-                        key_entry = future.result()
-                        if key_entry:
-                            results.append(key_entry)
-                            keys_found += 1
-                            processed_keys += 1
-                            key_progress = (processed_keys / total_keys) * 100
-                            
-                            elapsed_time = time.time() - start_time
-                            if processed_keys > 0:
-                                estimated_total_time = (elapsed_time / processed_keys) * total_keys
-                                estimated_remaining_time = estimated_total_time - elapsed_time
-                                log_message(f"    Processed key {processed_keys}/{total_keys} ({key_progress:.1f}%) - ETA: {estimated_remaining_time:.0f}s remaining")
-                    except Exception as e:
-                        print(f"    Error processing key {key_id}: {e}")
+        combined_results.extend(region_results)
     
-    # Generate CSV report
-    log_message(f"\nGenerating CSV report...")
-    generate_csv_report(results, output_file)
+    # Generate CSV report with all results
+    log_message(f"\nGenerating CSV report with combined results...")
+    generate_csv_report(combined_results, output_file)
     
     # Summary
     total_time = time.time() - start_time
     print(f"\nSummary:")
-    print(f"  Successfully processed {keys_found} encryption keys across {total_vaults} vaults")
+    print(f"  Successfully processed {len(combined_results)} encryption keys across {len(regions_to_scan)} regions")
     print(f"  Total execution time: {total_time:.1f} seconds")
     print(f"  CSV report: {output_file}")
     print("Done!")
 
 if __name__ == "__main__":
-    import json  # Import here to handle json in find_resources_using_key
     main()
