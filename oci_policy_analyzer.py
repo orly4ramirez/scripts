@@ -11,7 +11,7 @@ def parse_args():
     parser.add_argument('--tenancy-ocid', help='The OCID of your tenancy (optional, will read from config if not provided)')
     parser.add_argument('--profile', default='DEFAULT', help='OCI config profile to use (default: DEFAULT)')
     parser.add_argument('--output', default='oci_policies_by_group.csv', help='Output CSV file name (default: oci_policies_by_group.csv)')
-    parser.add_argument('--regions', help='Comma-separated list of regions to scan (optional, will read from config if not provided)')
+    parser.add_argument('--regions', help='Comma-separated list of regions to scan (optional, will scan all profiles\' regions if not provided)')
     return parser.parse_args()
 
 def get_config_info(profile='DEFAULT'):
@@ -32,12 +32,23 @@ def get_config_info(profile='DEFAULT'):
     tenancy = config[profile].get('tenancy')
     
     # Get all regions from all profiles
-    regions = set()
-    for section in config.sections():
-        if 'region' in config[section]:
-            regions.add(config[section]['region'])
+    regions = []
+    # First add the region from the specified profile (if exists)
+    if 'region' in config[profile]:
+        regions.append(config[profile]['region'])
+        print(f"Found region {config[profile]['region']} in profile {profile}")
     
-    return tenancy, list(regions)
+    # Then add regions from other profiles
+    for section in config.sections():
+        if 'region' in config[section] and config[section]['region'] not in regions:
+            regions.append(config[section]['region'])
+            print(f"Found region {config[section]['region']} in profile {section}")
+    
+    # If no regions found, add a default one as a fallback
+    if not regions and 'DEFAULT' in config and 'region' in config['DEFAULT']:
+        regions.append(config['DEFAULT']['region'])
+    
+    return tenancy, regions
 
 def run_oci_command(command):
     try:
@@ -164,8 +175,8 @@ def main():
         regions = config_regions
     
     if not regions:
-        print("Error: No regions specified and none found in OCI config.")
-        print("Please provide regions with --regions or ensure they're in your OCI config file.")
+        print(f"Error: No regions found. Please check your OCI config file at ~/.oci/config")
+        print("Manually specify regions with --regions us-ashburn-1,us-phoenix-1")
         exit(1)
     
     print(f"Using tenancy OCID: {tenancy_ocid}")
