@@ -1,246 +1,568 @@
 #!/usr/bin/env python3
 """
-OCI Encryption Keys Analyzer
-----------------------------
-Extracts comprehensive information about encryption keys in OCI,
-including vaults, master keys, key versions, and their usage.
+OCI Encryption Keys Multi-Region CSV Generator
+----------------------------------------------
+This script retrieves all encryption keys from OCI vaults across multiple regions
+and outputs a single CSV file with key properties and resource usage.
+
+Requirements:
+- Python 3.6+
+- OCI Python SDK (pip install oci)
+- Configured OCI config file (~/.oci/config)
 """
 
 import oci
+import csv
 import argparse
-import json
-import datetime
+import os
 import sys
+import json
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from concurrent.futures import ThreadPoolExecutor
 
-def extract_key_details(config, compartment_id, include_key_versions=True, include_key_usage=True):
-    """Extract detailed information about encryption keys in the specified compartment."""
-    print(f"Analyzing encryption keys in compartment: {compartment_id}")
+# Default regions to scan
+DEFAULT_REGIONS = ['us-ashburn-1', 'us-phoenix-1']
+
+def safe_parse_datetime(date_string):
+    """Safely parse datetime string with enhanced error handling"""
+    if not date_string:
+        return ""
     
-    # Initialize clients
-    kms_vault_client = oci.key_management.KmsVaultClient(config)
-    identity_client = oci.identity.IdentityClient(config)
+    # Trim whitespace and check for empty string
+    date_string = date_string.strip()
+    if not date_string:
+        return ""
     
-    # Get compartment details for better reporting
+    # List of possible formats to try
+    formats = [
+        "%Y-%m-%dT%H:%M:%S.%fZ",    # Standard ISO format with microseconds
+        "%Y-%m-%dT%H:%M:%SZ",       # ISO format without microseconds
+        "%Y-%m-%dT%H:%M:%S",        # ISO format without Z
+        "%Y-%m-%d %H:%M:%S",        # Standard datetime format
+        "%Y-%m-%d",                 # Date only
+        "%Y/%m/%d",                 # Date with slashes
+        "%d-%m-%Y",                 # European format
+        "%m/%d/%Y",                 # US format
+        "%b %d, %Y",                # Month abbreviated
+        "%B %d, %Y"                 # Month full name
+    ]
+    
+    # Try each format
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_string, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    
+    # If all parsing attempts fail, return the original string
+    # but truncate if it's too long
+    if len(date_string) > 30:
+        return date_string[:27] + "..."
+    return date_string
+
+def get_all_compartments(identity_client, compartment_id):
+    """Retrieve all compartments in the tenancy recursively"""
     try:
-        compartment = identity_client.get_compartment(compartment_id).data
-        compartment_name = compartment.name
-        print(f"Compartment name: {compartment_name}")
-    except:
-        compartment_name = "Unknown"
-        print("Could not retrieve compartment name")
-    
-    # Get all vaults in the compartment
-    try:
-        vaults = oci.pagination.list_call_get_all_results(
-            kms_vault_client.list_vaults,
-            compartment_id
-        ).data
-        print(f"Found {len(vaults)} vaults")
+        compartments = []
+        list_compartments_response = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            compartment_id,
+            compartment_id_in_subtree=True,
+            lifecycle_state="ACTIVE"
+        )
+        
+        # Add the root compartment
+        if compartment_id not in [c.id for c in list_compartments_response.data]:
+            try:
+                root_compartment = identity_client.get_compartment(compartment_id).data
+                compartments.append(root_compartment)
+            except Exception as e:
+                print(f"Error retrieving root compartment: {e}")
+        
+        compartments.extend(list_compartments_response.data)
+        return compartments
     except Exception as e:
-        print(f"Error retrieving vaults: {e}")
+        print(f"Error retrieving compartments: {e}")
+        return []
+
+def find_compartment_by_name(identity_client, tenancy_id, compartment_name):
+    """Find a compartment by its name and return its OCID"""
+    print(f"Looking up compartment with name: {compartment_name}")
+    
+    # List all compartments in the tenancy
+    compartments = []
+    try:
+        compartments_response = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            tenancy_id,
+            compartment_id_in_subtree=True,
+            lifecycle_state="ACTIVE"
+        )
+        compartments = compartments_response.data
+        
+        # Also check the root compartment
+        try:
+            root_compartment = identity_client.get_compartment(tenancy_id).data
+            if root_compartment.name.lower() == compartment_name.lower():
+                return root_compartment.id
+            compartments.append(root_compartment)
+        except Exception as e:
+            print(f"Warning: Error retrieving root compartment: {e}")
+    
+    except Exception as e:
+        print(f"Error looking up compartments: {e}")
         return None
     
-    # Initialize results structure
-    results = {
-        'compartment_id': compartment_id,
-        'compartment_name': compartment_name,
-        'scan_time': datetime.datetime.now().isoformat(),
-        'vaults': []
-    }
+    # Search for the compartment by name (case-insensitive)
+    for compartment in compartments:
+        if compartment.name.lower() == compartment_name.lower():
+            print(f"Found compartment: {compartment.name} (ID: {compartment.id})")
+            return compartment.id
     
-    # For each vault, get detailed information
-    for vault in vaults:
-        print(f"Processing vault: {vault.display_name} (ID: {vault.id})")
+    print(f"Error: No compartment found with name '{compartment_name}'")
+    return None
+
+def get_vaults_in_compartment(config, compartment_id, compartment_name="Unknown compartment"):
+    """Retrieve all vaults in a compartment"""
+    try:
+        # Create a client for listing vaults
+        vault_client = oci.key_management.KmsVaultClient(config)
         
-        vault_details = {
-            'id': vault.id,
-            'name': vault.display_name,
-            'lifecycle_state': vault.lifecycle_state,
-            'crypto_endpoint': vault.crypto_endpoint,
-            'management_endpoint': vault.management_endpoint,
-            'time_created': vault.time_created.isoformat() if vault.time_created else None,
-            'vault_type': vault.vault_type if hasattr(vault, 'vault_type') else None,
-            'keys': []
+        vaults_response = oci.pagination.list_call_get_all_results(
+            vault_client.list_vaults,
+            compartment_id
+        )
+        return vaults_response.data
+    except Exception as e:
+        # Simplified error message
+        print(f"Error retrieving vaults in {compartment_name}. Check permissions.")
+        return []
+
+def get_keys_in_vault(config, compartment_id, vault_id, management_endpoint, vault_name="Unknown vault"):
+    """Retrieve all keys in a vault"""
+    try:
+        # Create a new client specific to this vault's management endpoint
+        vault_client = oci.key_management.KmsManagementClient(
+            config,
+            service_endpoint=management_endpoint
+        )
+        
+        keys_response = oci.pagination.list_call_get_all_results(
+            vault_client.list_keys,
+            compartment_id
+        )
+        return keys_response.data
+    except Exception as e:
+        # Simplified error message
+        print(f"Error retrieving keys in vault {vault_name}. Check endpoint configuration.")
+        return []
+
+def get_key_details(config, key_id, management_endpoint, key_name="Unknown key"):
+    """Retrieve details for a specific key"""
+    try:
+        # Create a new client specific to this vault's management endpoint
+        vault_client = oci.key_management.KmsManagementClient(
+            config,
+            service_endpoint=management_endpoint
+        )
+        
+        key_response = vault_client.get_key(key_id)
+        return key_response.data
+    except Exception as e:
+        # Simplified error message
+        print(f"Error retrieving details for key {key_name}. Check key access.")
+        return None
+
+def get_key_versions(config, key_id, management_endpoint, key_name="Unknown key"):
+    """Retrieve versions for a specific key"""
+    try:
+        # Create a new client specific to this vault's management endpoint
+        vault_client = oci.key_management.KmsManagementClient(
+            config,
+            service_endpoint=management_endpoint
+        )
+        
+        versions_response = oci.pagination.list_call_get_all_results(
+            vault_client.list_key_versions,
+            key_id
+        )
+        return versions_response.data
+    except Exception as e:
+        # Simplified error message
+        print(f"Error retrieving versions for key {key_name}. Check key access.")
+        return []
+
+def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
+    """Find resources that use a specific key"""
+    try:
+        search_text = f"""
+            query all resources
+            where (
+                definedTags.contains('*.\"EncryptionKey\".*') ||
+                freeformTags.contains('*EncryptionKey*') ||
+                (resourceType = 'VolumeBackup' && isEncrypted = 'true') ||
+                (resourceType = 'BootVolume' && isEncrypted = 'true') ||
+                (resourceType = 'Volume' && isEncrypted = 'true') ||
+                (resourceType = 'Bucket' && isEncrypted = 'true') ||
+                (resourceType = 'Database' && isEncrypted = 'true') ||
+                (resourceType = 'AutonomousDatabase' && isEncrypted = 'true') ||
+                (resourceType = 'FileSystem' && isEncrypted = 'true')
+            )
+        """
+        
+        search_response = search_client.search_resources(
+            oci.resource_search.models.StructuredSearchDetails(
+                query=search_text
+            )
+        )
+        
+        # Filter results to find resources that reference this key
+        resources = []
+        for item in search_response.data.items:
+            resource_json = json.dumps(oci.util.to_dict(item))
+            if key_id in resource_json:
+                resources.append(item)
+        
+        if not resources:
+            print(f"No resources using key '{key_name}'")
+        
+        return resources
+    except Exception as e:
+        print(f"Error accessing resources for key '{key_name}'")
+        return []
+
+def process_key(region, key_data, compartment_data, vault_data, config, search_client):
+    """Process a single key and collect all its details"""
+    try:
+        key_id = key_data.id
+        key_name = key_data.display_name
+        management_endpoint = vault_data.management_endpoint
+        
+        # Get key details
+        key_details = get_key_details(
+            config,
+            key_id,
+            management_endpoint,
+            key_name
+        )
+        
+        if not key_details:
+            print(f"No details available for key {key_name}. Skipping.")
+            return None
+        
+        # Get key versions
+        key_versions = get_key_versions(
+            config,
+            key_id,
+            management_endpoint,
+            key_name
+        )
+        
+        # Find resources using this key
+        resources_using_key = find_resources_using_key(
+            search_client,
+            key_id,
+            key_name
+        )
+        
+        print(f"Key {key_name}: Found {len(resources_using_key)} resources using this key")
+        
+        # Create key entry
+        key_entry = {
+            "region": region,
+            "compartment_id": compartment_data.id,
+            "compartment_name": compartment_data.name,
+            "vault_id": vault_data.id,
+            "vault_name": vault_data.display_name,
+            "vault_management_endpoint": vault_data.management_endpoint,
+            "vault_crypto_endpoint": vault_data.crypto_endpoint,
+            "key_details": oci.util.to_dict(key_details),
+            "key_versions": [oci.util.to_dict(version) for version in key_versions],
+            "resources_using_key": [oci.util.to_dict(resource) for resource in resources_using_key]
         }
         
-        # Only get keys if the vault is active
-        if vault.lifecycle_state == "ACTIVE":
-            try:
-                # Create management client for this vault
-                kms_management_client = oci.key_management.KmsManagementClient(
-                    config, 
-                    service_endpoint=vault.management_endpoint
-                )
-                
-                # Get all keys in the vault
-                keys = oci.pagination.list_call_get_all_results(
-                    kms_management_client.list_keys,
-                    compartment_id
-                ).data
-                print(f"  Found {len(keys)} keys in vault {vault.display_name}")
-                
-                # For each key, get detailed information
-                for key in keys:
-                    key_details = {
-                        'id': key.id,
-                        'name': key.display_name,
-                        'algorithm': key.algorithm,
-                        'length': key.length,
-                        'protection_mode': key.protection_mode,
-                        'lifecycle_state': key.lifecycle_state,
-                        'time_created': key.time_created.isoformat() if key.time_created else None,
-                        'key_versions': [],
-                        'key_usage': []
-                    }
-                    
-                    # Get key versions if requested
-                    if include_key_versions and key.lifecycle_state == "ENABLED":
-                        try:
-                            versions = oci.pagination.list_call_get_all_results(
-                                kms_management_client.list_key_versions,
-                                key.id
-                            ).data
-                            
-                            for version in versions:
-                                version_details = {
-                                    'id': version.id,
-                                    'time_created': version.time_created.isoformat() if version.time_created else None,
-                                    'lifecycle_state': version.lifecycle_state
-                                }
-                                key_details['key_versions'].append(version_details)
-                                
-                            print(f"    Found {len(versions)} versions for key {key.display_name}")
-                        except Exception as e:
-                            print(f"    Error retrieving versions for key {key.id}: {e}")
-                    
-                    # Get key usage if requested
-                    if include_key_usage:
-                        # We'll need to identify resources that use this key
-                        # This requires checking various resource types
-                        
-                        # Create a Vault Client to check for usage in secrets
-                        try:
-                            vault_client = oci.vault.VaultsClient(config)
-                            secrets = oci.pagination.list_call_get_all_results(
-                                vault_client.list_secrets,
-                                compartment_id
-                            ).data
-                            
-                            # Find secrets using this key
-                            for secret in secrets:
-                                if secret.key_id == key.id:
-                                    usage = {
-                                        'resource_type': 'Secret',
-                                        'resource_id': secret.id,
-                                        'resource_name': secret.display_name if hasattr(secret, 'display_name') else 'Unnamed',
-                                        'compartment_id': secret.compartment_id
-                                    }
-                                    key_details['key_usage'].append(usage)
-                        except Exception as e:
-                            print(f"    Error checking secret usage for key {key.id}: {e}")
-                        
-                        # Additional usage checks could be added here for:
-                        # - Block volumes
-                        # - Object Storage buckets
-                        # - Autonomous Databases
-                        # - File Storage
-                        # - Etc.
-                        
-                        print(f"    Found {len(key_details['key_usage'])} resources using key {key.display_name}")
-                    
-                    vault_details['keys'].append(key_details)
-            except Exception as e:
-                print(f"  Error retrieving keys for vault {vault.id}: {e}")
-        
-        results['vaults'].append(vault_details)
-    
-    return results
+        return key_entry
+    except Exception as e:
+        print(f"Error processing key {key_data.display_name if hasattr(key_data, 'display_name') else key_id}: {e}")
+        return None
 
-def extract_encryption_keys_recursive(config, compartment_id, include_child_compartments=False):
-    """Extract encryption keys from the specified compartment and optionally its children."""
-    results = {}
-    
-    # Get keys in the specified compartment
-    compartment_results = extract_key_details(config, compartment_id)
-    if compartment_results:
-        results[compartment_id] = compartment_results
-    
-    # If requested, get keys in child compartments
-    if include_child_compartments:
-        identity_client = oci.identity.IdentityClient(config)
-        try:
-            # Get child compartments
-            child_compartments = oci.pagination.list_call_get_all_results(
-                identity_client.list_compartments,
-                compartment_id
-            ).data
+def generate_csv_report(results, output_file):
+    """Generate CSV report from the collected results"""
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        
+        # Write header with resource information columns
+        writer.writerow([
+            "Region",
+            "Compartment Name", 
+            "Vault Name", 
+            "Key Name", 
+            "Key ID", 
+            "Algorithm", 
+            "Protection Mode", 
+            "Current Key Version", 
+            "State", 
+            "Key Created Date",
+            "Resource Type",
+            "Resource Name",
+            "Resource ID",
+            "Resource State"
+        ])
+        
+        # Write data with resource details
+        for key_entry in results:
+            key_details = key_entry.get("key_details", {})
+            resources = key_entry.get("resources_using_key", [])
             
-            if child_compartments:
-                print(f"\nFound {len(child_compartments)} child compartments. Scanning recursively...")
+            created_date = safe_parse_datetime(key_details.get("time_created", ""))
+            
+            # Common key information
+            key_info = [
+                key_entry.get("region", "Unknown"),
+                key_entry.get("compartment_name", "Unknown"),
+                key_entry.get("vault_name", "Unknown"),
+                key_details.get("display_name", "Unknown"),
+                key_details.get("id", "Unknown"),
+                key_details.get("algorithm", "Unknown"),
+                key_details.get("protection_mode", "Unknown"),
+                key_details.get("current_key_version", "Unknown"),
+                key_details.get("lifecycle_state", "Unknown"),
+                created_date
+            ]
+            
+            # If no resources found, write one row with empty resource fields
+            if not resources:
+                writer.writerow(key_info + ["No resources", "", "", ""])
+            else:
+                # Write a row for each resource using this key
+                for resource in resources:
+                    resource_type = resource.get("resource_type", "Unknown")
+                    resource_name = resource.get("display_name", "No name")
+                    resource_id = resource.get("identifier", "Unknown")
+                    resource_state = resource.get("lifecycle_state", "Unknown")
+                    
+                    writer.writerow(key_info + [resource_type, resource_name, resource_id, resource_state])
+    
+    print(f"CSV report generated: {output_file}")
+
+def process_region(region, config, compartment_id, max_workers, quiet):
+    """Process a single region and return results"""
+    # Copy config and update the region
+    region_config = config.copy()
+    region_config["region"] = region
+    
+    # Setup logging based on quiet mode
+    def log_message(msg):
+        if not quiet:
+            print(f"[{region}] {msg}")
+    
+    # Initialize OCI clients for this region
+    try:
+        identity_client = oci.identity.IdentityClient(region_config)
+        search_client = oci.resource_search.ResourceSearchClient(region_config)
+        
+        # Test the connection
+        identity_client.list_regions()
+    except Exception as e:
+        print(f"[{region}] Error initializing OCI clients: {e}")
+        print(f"[{region}] Skipping region.")
+        return []
+    
+    # Get all compartments
+    compartments = get_all_compartments(identity_client, compartment_id)
+    log_message(f"Found {len(compartments)} compartments")
+    
+    # Results array for this region
+    results = []
+    
+    # Track vaults and keys for progress reporting
+    total_vaults = 0
+    processed_vaults = 0
+    
+    # First count vaults
+    for compartment in compartments:
+        vaults = get_vaults_in_compartment(region_config, compartment.id, compartment.name)
+        total_vaults += len(vaults)
+    
+    log_message(f"Found {total_vaults} vaults")
+    
+    # Process each compartment
+    for compartment in compartments:
+        log_message(f"Processing compartment: {compartment.name}")
+        
+        # Get vaults in compartment
+        vaults = get_vaults_in_compartment(region_config, compartment.id, compartment.name)
+        if not vaults:
+            log_message(f"  No vaults found in {compartment.name}")
+            continue
+            
+        log_message(f"  Found {len(vaults)} vaults in {compartment.name}")
+        
+        for vault in vaults:
+            processed_vaults += 1
+            vault_progress = (processed_vaults / total_vaults) * 100 if total_vaults > 0 else 0
+            
+            log_message(f"  Processing vault: {vault.display_name} ({processed_vaults}/{total_vaults}, {vault_progress:.1f}%)")
+            
+            # Skip vaults without management endpoint
+            if not vault.management_endpoint:
+                log_message(f"    No management endpoint available for vault {vault.display_name}. Skipping.")
+                continue
+            
+            # Get keys in vault
+            keys = get_keys_in_vault(
+                region_config,
+                compartment.id,
+                vault.id,
+                vault.management_endpoint,
+                vault.display_name
+            )
+            
+            if not keys:
+                log_message(f"    No keys found in vault {vault.display_name}")
+                continue
                 
-                for child in child_compartments:
-                    if child.lifecycle_state == "ACTIVE":
-                        print(f"\nScanning child compartment: {child.name} (ID: {child.id})")
-                        child_results = extract_key_details(config, child.id)
-                        if child_results:
-                            results[child.id] = child_results
-        except Exception as e:
-            print(f"Error retrieving child compartments: {e}")
+            log_message(f"    Found {len(keys)} keys in vault {vault.display_name}")
+            
+            # Process each key using thread pool for better performance
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        process_key, 
+                        region,
+                        key, 
+                        compartment, 
+                        vault,
+                        region_config,
+                        search_client
+                    ): key.id for key in keys
+                }
+                
+                for future in as_completed(futures):
+                    key_id = futures[future]
+                    try:
+                        key_entry = future.result()
+                        if key_entry:
+                            results.append(key_entry)
+                    except Exception as e:
+                        print(f"    Error processing key {key_id}: {e}")
     
     return results
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract OCI encryption key information')
-    parser.add_argument('--compartment-id', help='Compartment OCID to scan (defaults to tenancy)')
-    parser.add_argument('--config', default='~/.oci/config', help='OCI config file')
-    parser.add_argument('--profile', default='DEFAULT', help='OCI config profile')
-    parser.add_argument('--output', default='oci_keys.json', help='Output file path')
-    parser.add_argument('--include-children', action='store_true', help='Scan child compartments')
-    parser.add_argument('--no-versions', action='store_true', help='Skip key version details')
-    parser.add_argument('--no-usage', action='store_true', help='Skip key usage details')
-    
+    parser = argparse.ArgumentParser(description='OCI Encryption Keys Multi-Region CSV Generator')
+    parser.add_argument('--compartment-id', help='OCID of the compartment to search (default: root compartment)')
+    parser.add_argument('--compartment-name', help='Name of the compartment to search (alternative to compartment-id)')
+    parser.add_argument('--config-file', default='~/.oci/config', help='Path to OCI config file')
+    parser.add_argument('--profile', default='DEFAULT', help='OCI config profile to use')
+    parser.add_argument('--regions', help='Comma-separated list of regions to scan (default: us-ashburn-1,us-phoenix-1)')
+    parser.add_argument('--output-file', help='Output CSV file path (default: auto-generated with date suffix)')
+    parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of worker threads')
+    parser.add_argument('--quiet', action='store_true', help='Minimize output messages')
     args = parser.parse_args()
+    
+    # Setup logging based on quiet mode
+    def log_message(msg):
+        if not args.quiet:
+            print(msg)
+    
+    # Generate default output filename with date suffix if not specified
+    if not args.output_file:
+        date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_file = f"./oci_encryption_keys_report_{date_suffix}.csv"
+    
+    # Expand user directory
+    config_file = os.path.expanduser(args.config_file)
+    output_file = os.path.expanduser(args.output_file)
+    
+    # Create output directory if it doesn't exist
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # Set regions to scan
+    if args.regions:
+        regions_to_scan = [r.strip() for r in args.regions.split(',')]
+    else:
+        regions_to_scan = DEFAULT_REGIONS
+    
+    log_message(f"Starting OCI Encryption Keys Multi-Region CSV generator...")
+    log_message(f"Using config file: {config_file}")
+    log_message(f"Using profile: {args.profile}")
+    log_message(f"Scanning regions: {', '.join(regions_to_scan)}")
+    log_message(f"Output file will be saved to: {output_file}")
     
     # Load OCI config
     try:
-        config = oci.config.from_file(args.config, args.profile)
-        oci.config.validate_config(config)
+        config = oci.config.from_file(config_file, args.profile)
     except Exception as e:
-        print(f"Error loading OCI config: {e}")
+        print(f"Error loading OCI configuration: {e}")
+        print("Please check your OCI configuration and permissions.")
         sys.exit(1)
     
-    # If no compartment ID specified, use the tenancy from config
-    compartment_id = args.compartment_id
-    if not compartment_id:
-        try:
-            # Get tenancy ID from config
-            compartment_id = config['tenancy']
-            print(f"No compartment ID specified, using tenancy: {compartment_id}")
-        except KeyError:
-            print("Error: No compartment ID specified and tenancy ID not found in config")
+    # Get tenancy ID from config
+    tenancy_id = config.get('tenancy')
+    log_message(f"Tenancy ID: {tenancy_id}")
+    
+    # Determine the compartment ID
+    compartment_id = None
+    compartment_name = None
+    
+    # If compartment name is provided, look up its ID
+    if args.compartment_name:
+        compartment_name = args.compartment_name
+        log_message(f"Looking up compartment: {compartment_name}")
+        
+        # Need to create a client with a valid region first
+        temp_config = config.copy()
+        temp_config["region"] = regions_to_scan[0]
+        identity_client = oci.identity.IdentityClient(temp_config)
+        
+        compartment_id = find_compartment_by_name(identity_client, tenancy_id, compartment_name)
+        if not compartment_id:
+            print("Error: Could not find compartment by name. Please check the name or use compartment ID instead.")
             sys.exit(1)
+        log_message(f"Found compartment: {compartment_name} (ID: {compartment_id})")
+    else:
+        # Use the provided compartment ID or default to tenancy
+        compartment_id = args.compartment_id
+        if not compartment_id:
+            compartment_id = tenancy_id
+            log_message(f"No compartment specified, using root compartment")
     
+    # Process each region
     start_time = time.time()
+    combined_results = []
     
-    # Extract encryption key information
-    results = extract_encryption_keys_recursive(
-        config,
-        compartment_id,
-        include_child_compartments=args.include_children,
-    )
+    for region in regions_to_scan:
+        log_message(f"\nProcessing region: {region}")
+        region_start_time = time.time()
+        
+        region_results = process_region(
+            region,
+            config,
+            compartment_id,
+            args.max_workers,
+            args.quiet
+        )
+        
+        region_time = time.time() - region_start_time
+        log_message(f"Completed region {region}: Found {len(region_results)} keys in {region_time:.1f} seconds")
+        
+        combined_results.extend(region_results)
     
-    # Save results to file
-    try:
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"\nResults saved to {args.output}")
-    except Exception as e:
-        print(f"Error saving results: {e}")
+    # Generate CSV report with all results
+    log_message(f"\nGenerating CSV report with combined results...")
+    generate_csv_report(combined_results, output_file)
     
-    end_time = time.time()
-    print(f"Completed in {end_time - start_time:.2f} seconds")
+    # Summary
+    total_time = time.time() - start_time
+    print(f"\nSummary:")
+    print(f"  Successfully processed {len(combined_results)} encryption keys across {len(regions_to_scan)} regions")
+    print(f"  Total execution time: {total_time:.1f} seconds")
+    print(f"  CSV report: {output_file}")
+    print("Done!")
 
 if __name__ == "__main__":
     main()
