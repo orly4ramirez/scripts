@@ -218,47 +218,72 @@ def get_vault_secrets(config, compartment_id, vault_id, vault_name="Unknown vaul
     try:
         # Create a client for secrets
         secrets_client = oci.secrets.SecretsClient(config)
-        vaults_client = oci.vault.VaultsClient(config)
         
         # For better debugging
         logger.info(f"Searching for secrets in vault: {vault_name}")
         
         # List all secrets in the compartment that belong to this vault
+        # The correct method is list_secrets_by_compartment according to OCI SDK docs
         try:
-            # Using list_secrets_by_compartment method which is the correct method name
             secrets_response = oci.pagination.list_call_get_all_results(
-                secrets_client.list_secrets,
-                compartment_id=compartment_id,
-                vault_id=vault_id
-            )
-            logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using SecretsClient")
-            return secrets_response.data
-        except AttributeError:
-            # Try a different method name that might exist in the SDK
-            try:
-                logger.info(f"Trying alternative method list_secrets_by_compartment for vault {vault_name}")
-                secrets_response = oci.pagination.list_call_get_all_results(
-                    secrets_client.list_secrets_by_compartment,
-                    compartment_id=compartment_id,
-                    vault_id=vault_id
-                )
-                logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using list_secrets_by_compartment")
-                return secrets_response.data
-            except AttributeError:
-                # If both methods fail, try the vaults client
-                logger.warning(f"Error with SecretsClient methods. Trying VaultsClient for vault {vault_name}")
-                
-        # Try using the Vaults client as fallback
-        try:
-            vault_secrets_response = oci.pagination.list_call_get_all_results(
-                vaults_client.list_secrets,
+                secrets_client.list_secrets_by_compartment,
                 compartment_id,
                 vault_id=vault_id
             )
-            logger.info(f"Found {len(vault_secrets_response.data)} secrets in vault {vault_name} using VaultsClient")
-            return vault_secrets_response.data
-        except AttributeError:
-            logger.warning(f"Error: VaultsClient also has no list_secrets method for vault {vault_name}")
+            logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using list_secrets_by_compartment")
+            return secrets_response.data
+        except Exception as e:
+            logger.warning(f"Error using list_secrets_by_compartment: {str(e)}")
+            
+            # Try alternative methods if needed
+            try:
+                # Check if the SDK version has this method instead
+                secrets_response = secrets_client.list_secrets(
+                    compartment_id,
+                    vault_id=vault_id
+                ).data
+                logger.info(f"Found {len(secrets_response)} secrets in vault {vault_name} using list_secrets")
+                return secrets_response
+            except Exception as e2:
+                logger.warning(f"Error using list_secrets: {str(e2)}")
+                
+                # Use search as fallback method for finding secrets
+                try:
+                    logger.info(f"Trying search method to find secrets in vault {vault_name}")
+                    search_client = oci.resource_search.ResourceSearchClient(config)
+                    
+                    search_text = f"query Secret resources where (vaultId = '{vault_id}')"
+                    search_details = oci.resource_search.models.StructuredSearchDetails(
+                        query=search_text
+                    )
+                    
+                    search_response = search_client.search_resources(search_details)
+                    
+                    # Convert search results to a format compatible with our processing
+                    if search_response.data.items:
+                        logger.info(f"Found {len(search_response.data.items)} secrets via search in vault {vault_name}")
+                        
+                        # Create secret-like objects
+                        from types import SimpleNamespace
+                        search_secrets = []
+                        
+                        for item in search_response.data.items:
+                            # Create a simple object with required attributes
+                            secret_obj = SimpleNamespace(
+                                id=item.identifier,
+                                display_name=item.display_name if hasattr(item, 'display_name') else "Unknown Secret",
+                                compartment_id=item.compartment_id,
+                                lifecycle_state=item.lifecycle_state if hasattr(item, 'lifecycle_state') else "UNKNOWN"
+                            )
+                            search_secrets.append(secret_obj)
+                        
+                        return search_secrets
+                    else:
+                        logger.info(f"No secrets found via search in vault {vault_name}")
+                        return []
+                except Exception as e3:
+                    logger.warning(f"Error using search method for secrets: {str(e3)}")
+                    return []
     except Exception as e:
         # Improved error message with more details
         logger.error(f"Error retrieving secrets in vault {vault_name}: {str(e)}")
@@ -360,11 +385,8 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
             )
         """
         
-        # Create search details without the problematic 'limit' parameter
-        search_details = oci.resource_search.models.StructuredSearchDetails(
-            query=search_text,
-            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
-        )
+        # Create search details without ANY problematic parameters
+        search_details = oci.resource_search.models.StructuredSearchDetails(query=search_text)
         
         search_response = search_client.search_resources(search_details)
         
@@ -436,11 +458,8 @@ def find_resources_using_secret(search_client, secret_id, secret_name="Unknown s
             )
         """
         
-        # Create search details without the problematic 'limit' parameter
-        search_details = oci.resource_search.models.StructuredSearchDetails(
-            query=search_text,
-            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
-        )
+        # Create search details WITHOUT any additional parameters
+        search_details = oci.resource_search.models.StructuredSearchDetails(query=search_text)
         
         search_response = search_client.search_resources(search_details)
         
@@ -782,46 +801,6 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                     vault.display_name
                 )
                 
-                # Try a second method to find secrets if none were found with the first method
-                if not secrets:
-                    try:
-                        log_message(f"    Trying alternate method to find secrets in vault {vault.display_name}")
-                        
-                        # Use the search client as a backup method - create search details without limit parameter
-                        search_text = f"""
-                            query VaultSecret resources
-                            where (vaultId = '{vault.id}')
-                        """
-                        
-                        search_details = oci.resource_search.models.StructuredSearchDetails(
-                            query=search_text,
-                            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
-                        )
-                        
-                        search_response = search_client.search_resources(search_details)
-                        
-                        # Convert search results to a format compatible with our processing
-                        if search_response.data.items:
-                            log_message(f"    Found {len(search_response.data.items)} secrets via search in vault {vault.display_name}")
-                            
-                            # We need to create secret-like objects from the search results
-                            from types import SimpleNamespace
-                            search_secrets = []
-                            
-                            for item in search_response.data.items:
-                                # Create a simple object with id and display_name attributes
-                                secret_obj = SimpleNamespace(
-                                    id=item.identifier,
-                                    display_name=item.display_name if hasattr(item, 'display_name') else "Unknown Secret",
-                                    compartment_id=item.compartment_id,
-                                    lifecycle_state=item.lifecycle_state if hasattr(item, 'lifecycle_state') else "UNKNOWN"
-                                )
-                                search_secrets.append(secret_obj)
-                            
-                            secrets = search_secrets
-                    except Exception as search_e:
-                        logger.warning(f"    Error using search method for secrets in vault {vault.display_name}: {str(search_e)}")
-                
                 if secrets:
                     log_message(f"    Found {len(secrets)} secrets in vault {vault.display_name}")
                     
@@ -849,7 +828,61 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                             except Exception as e:
                                 logger.error(f"    Error processing secret '{secret_name}': {str(e)}")
                 else:
-                    log_message(f"    No secrets found in vault {vault.display_name}")
+                    # Fallback to direct search query if no secrets were found through API
+                    try:
+                        log_message(f"    Trying direct search for secrets in vault {vault.display_name}")
+                        
+                        # Use the search client as a backup method - without any extra parameters
+                        search_text = f"query Secret resources where (vaultId = '{vault.id}')"
+                        search_details = oci.resource_search.models.StructuredSearchDetails(query=search_text)
+                        
+                        search_response = search_client.search_resources(search_details)
+                        
+                        # Convert search results to secret-like objects
+                        if search_response.data.items:
+                            log_message(f"    Found {len(search_response.data.items)} secrets via direct search in vault {vault.display_name}")
+                            
+                            # Create secret-like objects
+                            from types import SimpleNamespace
+                            search_secrets = []
+                            
+                            for item in search_response.data.items:
+                                # Create a simple object with required attributes
+                                secret_obj = SimpleNamespace(
+                                    id=item.identifier,
+                                    display_name=item.display_name if hasattr(item, 'display_name') else "Unknown Secret",
+                                    compartment_id=item.compartment_id,
+                                    lifecycle_state=item.lifecycle_state if hasattr(item, 'lifecycle_state') else "UNKNOWN"
+                                )
+                                search_secrets.append(secret_obj)
+                            
+                            # Process each found secret
+                            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                                futures = {
+                                    executor.submit(
+                                        process_secret, 
+                                        region,
+                                        secret, 
+                                        compartment, 
+                                        vault,
+                                        region_config,
+                                        search_client
+                                    ): (getattr(secret, 'id', f"unknown-{id(secret)}"), 
+                                        getattr(secret, 'display_name', "Unknown Secret")) for secret in search_secrets
+                                }
+                                
+                                for future in as_completed(futures):
+                                    secret_id, secret_name = futures[future]
+                                    try:
+                                        secret_entry = future.result()
+                                        if secret_entry:
+                                            results.append(secret_entry)
+                                    except Exception as e:
+                                        logger.error(f"    Error processing secret '{secret_name}' from search: {str(e)}")
+                        else:
+                            log_message(f"    No secrets found via direct search in vault {vault.display_name}")
+                    except Exception as search_e:
+                        logger.warning(f"    Error searching for secrets in vault {vault.display_name}: {str(search_e)}")
             except Exception as e:
                 logger.error(f"    Error processing secrets in vault {vault.display_name}: {str(e)}")
     
