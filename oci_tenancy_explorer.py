@@ -559,9 +559,8 @@ def map_resource_type_to_service(resource_type, clients):
 def get_all_regions(identity_client):
     """Get all available regions in OCI."""
     try:
-        regions = identity_client.list_region_subscriptions(
-            identity_client.tenancy_id
-        ).data
+        tenancy_id = identity_client.tenancy_id
+        regions = identity_client.list_region_subscriptions(tenancy_id).data
         return [region.region_name for region in regions]
     except Exception as e:
         print(f"Error getting regions: {e}")
@@ -920,19 +919,28 @@ def main():
     profiles = get_config_profiles(config_file)
     print(f"Found profiles: {', '.join(profiles)}")
     
+    # Check if profiles exist
+    if not profiles:
+        print("No profiles found in the config file. Using DEFAULT config.")
+        config = oci.config.from_file(config_file)
+    else:
+        print(f"Using profile: {profiles[0]}")
+        config = oci.config.from_file(config_file, profiles[0])
+    
     all_resources = []
-    tenancy_id = None
     compartment_hierarchy = {}
     all_compartments = []
     skip_regions = [r.strip() for r in args.skip_regions.split(',') if r.strip()]
     
     # First, get the identity client to discover compartments and regions
     print("\nInitializing OCI identity client...")
-    primary_profile = profiles[0]  # Use the first profile for identity operations
-    config = oci.config.from_file(config_file, primary_profile)
     identity_client = oci.identity.IdentityClient(config)
     
     tenancy_id = config.get('tenancy')
+    if not tenancy_id:
+        print("Error: No tenancy ID found in the config file.")
+        sys.exit(1)
+        
     print(f"Looking for compartment: {args.compartment_name}")
     compartment = get_compartment_by_name(identity_client, tenancy_id, args.compartment_name)
     print(f"Found compartment: {compartment.name}")
@@ -940,6 +948,15 @@ def main():
     # Get all regions
     print("Getting all available regions...")
     all_regions = get_all_regions(identity_client)
+    if not all_regions:
+        print("Warning: No regions found. Using region from config file.")
+        region = config.get('region')
+        if region:
+            all_regions = [region]
+        else:
+            print("Error: No region specified in config file.")
+            sys.exit(1)
+            
     if skip_regions:
         print(f"Skipping regions: {', '.join(skip_regions)}")
         all_regions = [r for r in all_regions if r not in skip_regions]
