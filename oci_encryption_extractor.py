@@ -221,40 +221,47 @@ def get_vault_secrets(config, compartment_id, vault_id, vault_name="Unknown vaul
         vaults_client = oci.vault.VaultsClient(config)
         
         # For better debugging
-        logger.info(f"Searching for secrets in vault: {vault_name} (ID: {vault_id})")
+        logger.info(f"Searching for secrets in vault: {vault_name}")
         
         # List all secrets in the compartment that belong to this vault
-        secrets_response = oci.pagination.list_call_get_all_results(
-            secrets_client.list_secrets,
-            compartment_id,
-            vault_id=vault_id
-        )
-        
-        # Also try using the Vaults client for better coverage
+        try:
+            # Using list_secrets_by_compartment method which is the correct method name
+            secrets_response = oci.pagination.list_call_get_all_results(
+                secrets_client.list_secrets,
+                compartment_id=compartment_id,
+                vault_id=vault_id
+            )
+            logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using SecretsClient")
+            return secrets_response.data
+        except AttributeError:
+            # Try a different method name that might exist in the SDK
+            try:
+                logger.info(f"Trying alternative method list_secrets_by_compartment for vault {vault_name}")
+                secrets_response = oci.pagination.list_call_get_all_results(
+                    secrets_client.list_secrets_by_compartment,
+                    compartment_id=compartment_id,
+                    vault_id=vault_id
+                )
+                logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using list_secrets_by_compartment")
+                return secrets_response.data
+            except AttributeError:
+                # If both methods fail, try the vaults client
+                logger.warning(f"Error with SecretsClient methods. Trying VaultsClient for vault {vault_name}")
+                
+        # Try using the Vaults client as fallback
         try:
             vault_secrets_response = oci.pagination.list_call_get_all_results(
                 vaults_client.list_secrets,
                 compartment_id,
                 vault_id=vault_id
             )
-            combined_secrets = list(secrets_response.data)
-            
-            # Check if we got any additional secrets from the vaults client
-            for secret in vault_secrets_response.data:
-                if secret.id not in [s.id for s in combined_secrets]:
-                    combined_secrets.append(secret)
-            
-            logger.info(f"Found {len(combined_secrets)} secrets in vault {vault_name} using combined methods")
-            return combined_secrets
-        except Exception as e:
-            # If vaults client method fails, return the secrets from the first method
-            logger.warning(f"Error using VaultsClient to get secrets, fallback to SecretsClient only: {e}")
-            logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using SecretsClient only")
-            return secrets_response.data
-            
+            logger.info(f"Found {len(vault_secrets_response.data)} secrets in vault {vault_name} using VaultsClient")
+            return vault_secrets_response.data
+        except AttributeError:
+            logger.warning(f"Error: VaultsClient also has no list_secrets method for vault {vault_name}")
     except Exception as e:
         # Improved error message with more details
-        logger.error(f"Error retrieving secrets in vault {vault_name} (ID: {vault_id}): {str(e)}")
+        logger.error(f"Error retrieving secrets in vault {vault_name}: {str(e)}")
         return []
 
 def get_secret_details(config, secret_id, secret_name="Unknown secret"):
@@ -316,7 +323,7 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
     """Find resources that use a specific key"""
     global resource_stats
     try:
-        logger.info(f"Searching for resources using key: {key_name} (ID: {key_id})")
+        logger.info(f"Searching for resources using key: {key_name}")
         
         # Comprehensive search query to find encrypted resources and their associations
         search_text = f"""
@@ -353,14 +360,13 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
             )
         """
         
-        search_response = search_client.search_resources(
-            oci.resource_search.models.StructuredSearchDetails(
-                query=search_text,
-                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
-                # Increase limit to find more resources
-                limit=1000
-            )
+        # Create search details without the problematic 'limit' parameter
+        search_details = oci.resource_search.models.StructuredSearchDetails(
+            query=search_text,
+            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
         )
+        
+        search_response = search_client.search_resources(search_details)
         
         # Filter results to find resources that reference this key
         resources = []
@@ -399,7 +405,7 @@ def find_resources_using_secret(search_client, secret_id, secret_name="Unknown s
     """Find resources that use a specific secret"""
     global resource_stats
     try:
-        logger.info(f"Searching for resources using secret: {secret_name} (ID: {secret_id})")
+        logger.info(f"Searching for resources using secret: {secret_name}")
         
         # Comprehensive search query for resources using secrets
         search_text = f"""
@@ -430,14 +436,13 @@ def find_resources_using_secret(search_client, secret_id, secret_name="Unknown s
             )
         """
         
-        search_response = search_client.search_resources(
-            oci.resource_search.models.StructuredSearchDetails(
-                query=search_text,
-                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
-                # Increase limit to find more resources
-                limit=1000
-            )
+        # Create search details without the problematic 'limit' parameter
+        search_details = oci.resource_search.models.StructuredSearchDetails(
+            query=search_text,
+            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
         )
+        
+        search_response = search_client.search_resources(search_details)
         
         # Filter results to find resources that reference this secret
         resources = []
@@ -751,17 +756,17 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                                 vault,
                                 region_config,
                                 search_client
-                            ): key.id for key in keys
+                            ): (key.id, key.display_name) for key in keys  # Store both ID and name
                         }
                         
                         for future in as_completed(futures):
-                            key_id = futures[future]
+                            key_id, key_name = futures[future]  # Unpack both values
                             try:
                                 key_entry = future.result()
                                 if key_entry:
                                     results.append(key_entry)
                             except Exception as e:
-                                logger.error(f"    Error processing key {key_id}: {str(e)}")
+                                logger.error(f"    Error processing key '{key_name}': {str(e)}")
                 else:
                     log_message(f"    No encryption keys found in vault {vault.display_name}")
             else:
@@ -782,19 +787,18 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                     try:
                         log_message(f"    Trying alternate method to find secrets in vault {vault.display_name}")
                         
-                        # Use the search client as a backup method
+                        # Use the search client as a backup method - create search details without limit parameter
                         search_text = f"""
                             query VaultSecret resources
                             where (vaultId = '{vault.id}')
                         """
                         
-                        search_response = search_client.search_resources(
-                            oci.resource_search.models.StructuredSearchDetails(
-                                query=search_text,
-                                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
-                                limit=1000
-                            )
+                        search_details = oci.resource_search.models.StructuredSearchDetails(
+                            query=search_text,
+                            matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS
                         )
+                        
+                        search_response = search_client.search_resources(search_details)
                         
                         # Convert search results to a format compatible with our processing
                         if search_response.data.items:
@@ -816,7 +820,7 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                             
                             secrets = search_secrets
                     except Exception as search_e:
-                        logger.warning(f"    Error using search method for secrets: {str(search_e)}")
+                        logger.warning(f"    Error using search method for secrets in vault {vault.display_name}: {str(search_e)}")
                 
                 if secrets:
                     log_message(f"    Found {len(secrets)} secrets in vault {vault.display_name}")
@@ -832,17 +836,18 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                                 vault,
                                 region_config,
                                 search_client
-                            ): getattr(secret, 'id', f"unknown-{id(secret)}") for secret in secrets
+                            ): (getattr(secret, 'id', f"unknown-{id(secret)}"), 
+                                getattr(secret, 'display_name', "Unknown Secret")) for secret in secrets
                         }
                         
                         for future in as_completed(futures):
-                            secret_id = futures[future]
+                            secret_id, secret_name = futures[future]  # Unpack both values
                             try:
                                 secret_entry = future.result()
                                 if secret_entry:
                                     results.append(secret_entry)
                             except Exception as e:
-                                logger.error(f"    Error processing secret {secret_id}: {str(e)}")
+                                logger.error(f"    Error processing secret '{secret_name}': {str(e)}")
                 else:
                     log_message(f"    No secrets found in vault {vault.display_name}")
             except Exception as e:
