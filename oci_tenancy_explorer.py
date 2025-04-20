@@ -4,7 +4,7 @@ OCI Tenancy Explorer
 
 This script emulates the OCI Tenancy Explorer functionality by recursively discovering
 all resources within a compartment (including child compartments) across all regions
-specified in the OCI config file and exporting the results to a CSV file.
+available in OCI and exporting the results to a CSV file.
 
 Usage: python oci_tenancy_explorer.py --compartment-name "your-compartment-name" [--recursive] [--output-file "output.csv"]
 """
@@ -27,6 +27,7 @@ def parse_arguments():
     parser.add_argument('--output-file', default='oci_resources.csv', help='Output CSV file path (default: oci_resources.csv)')
     parser.add_argument('--config-file', default='~/.oci/config', help='OCI config file path (default: ~/.oci/config)')
     parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of worker threads (default: 10)')
+    parser.add_argument('--skip-regions', help='Comma-separated list of regions to skip', default='')
     return parser.parse_args()
 
 def get_config_profiles(config_file):
@@ -555,6 +556,17 @@ def map_resource_type_to_service(resource_type, clients):
     
     return None, None
 
+def get_all_regions(identity_client):
+    """Get all available regions in OCI."""
+    try:
+        regions = identity_client.list_region_subscriptions(
+            identity_client.tenancy_id
+        ).data
+        return [region.region_name for region in regions]
+    except Exception as e:
+        print(f"Error getting regions: {e}")
+        return []
+
 def explore_tenancy(compartment_id, compartment_name, clients, region, max_workers=10):
     """Explore a compartment using Resource Search API + detailed service calls."""
     all_resources = []
@@ -593,6 +605,7 @@ def explore_tenancy(compartment_id, compartment_name, clients, region, max_worke
                 for resource in discovered_resources:
                     resource_type = resource.resource_type
                     resource_id = resource.identifier
+                    resource_name = resource.display_name if hasattr(resource, 'display_name') and resource.display_name else 'unnamed'
                     future = executor.submit(
                         extract_resource_details,
                         clients, 
@@ -602,22 +615,22 @@ def explore_tenancy(compartment_id, compartment_name, clients, region, max_worke
                         compartment_name,
                         region
                     )
-                    futures.append((future, resource_type))
+                    futures.append((future, resource_type, resource_name))
                 
                 completed = 0
                 total = len(futures)
-                for future, resource_type in futures:
+                for future, resource_type, resource_name in futures:
                     try:
                         resource_details = future.result()
                         completed += 1
                         if resource_details:
                             all_resources.append(resource_details)
-                            print(f"[{completed}/{total}] {resource_type}: {resource_details.get('Name', 'unnamed')} ({region})")
+                            print(f"[{completed}/{total}] {resource_type}: {resource_details.get('Name', resource_name)} ({region})")
                         else:
-                            print(f"[{completed}/{total}] {resource_type}: Could not extract details ({region})")
+                            print(f"[{completed}/{total}] {resource_type}: {resource_name} - Could not extract details ({region})")
                     except Exception as e:
                         completed += 1
-                        print(f"[{completed}/{total}] Error processing {resource_type} in {region}: {str(e)[:100]}")
+                        print(f"[{completed}/{total}] Error processing {resource_type}: {resource_name} in {region}: {str(e)[:100]}")
             
             return all_resources
             
@@ -642,7 +655,14 @@ def explore_tenancy(compartment_id, compartment_name, clients, region, max_worke
                 resources = future.result()
                 completed += 1
                 resource_count = len(resources)
-                print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found ({region})")
+                if resource_count > 0:
+                    resource_names = [r.get('Name', 'unnamed') for r in resources[:3]]
+                    name_display = ", ".join(resource_names)
+                    if len(resources) > 3:
+                        name_display += f" and {len(resources)-3} more..."
+                    print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found - {name_display} ({region})")
+                else:
+                    print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found ({region})")
                 all_resources.extend(resources)
             except Exception as e:
                 print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: Error - {str(e)[:100]} ({region})")
@@ -904,35 +924,56 @@ def main():
     tenancy_id = None
     compartment_hierarchy = {}
     all_compartments = []
+    skip_regions = [r.strip() for r in args.skip_regions.split(',') if r.strip()]
     
-    for profile in profiles:
-        print(f"\nProcessing profile: {profile}")
+    # First, get the identity client to discover compartments and regions
+    print("\nInitializing OCI identity client...")
+    primary_profile = profiles[0]  # Use the first profile for identity operations
+    config = oci.config.from_file(config_file, primary_profile)
+    identity_client = oci.identity.IdentityClient(config)
+    
+    tenancy_id = config.get('tenancy')
+    print(f"Looking for compartment: {args.compartment_name}")
+    compartment = get_compartment_by_name(identity_client, tenancy_id, args.compartment_name)
+    print(f"Found compartment: {compartment.name}")
+    
+    # Get all regions
+    print("Getting all available regions...")
+    all_regions = get_all_regions(identity_client)
+    if skip_regions:
+        print(f"Skipping regions: {', '.join(skip_regions)}")
+        all_regions = [r for r in all_regions if r not in skip_regions]
+    print(f"Will scan the following regions: {', '.join(all_regions)}")
+    
+    # Get compartments
+    compartments_to_scan = []
+    if args.recursive:
+        print("Scanning for child compartments...")
+        all_compartments = get_all_compartments(identity_client, tenancy_id)
+        compartment_hierarchy = build_compartment_hierarchy(identity_client, tenancy_id, all_compartments)
+        compartments_to_scan = [c for c in all_compartments 
+                             if c.id == compartment.id or 
+                                (hasattr(c, 'compartment_id') and 
+                                (c.compartment_id == compartment.id or
+                                (c.id != compartment.id and c.lifecycle_state == "ACTIVE")))]
+        print(f"Found {len(compartments_to_scan)} compartments to scan:")
+        for c in compartments_to_scan:
+            print(f"  - {compartment_hierarchy.get(c.id, c.name)}")
+    else:
+        compartments_to_scan = [compartment]
+        print(f"Scanning single compartment: {compartment.name}")
+    
+    # Scan all regions
+    for region in all_regions:
+        print(f"\nSwitching to region: {region}")
+        
         try:
-            config = oci.config.from_file(config_file, profile)
-            region = config.get('region', 'Unknown')
-            print(f"Initializing OCI clients for region: {region}...")
-            clients = get_service_clients(config)
+            # Create new config for this region
+            region_config = dict(config)
+            region_config['region'] = region
             
-            if not tenancy_id:
-                tenancy_id = config.get('tenancy')
-                print(f"Looking for compartment: {args.compartment_name}")
-                compartment = get_compartment_by_name(clients['identity'], tenancy_id, args.compartment_name)
-                print(f"Found compartment: {compartment.name}")
-                
-                compartments_to_scan = []
-                if args.recursive:
-                    print("Scanning for child compartments...")
-                    all_compartments = get_all_compartments(clients['identity'], tenancy_id)
-                    compartment_hierarchy = build_compartment_hierarchy(clients['identity'], tenancy_id, all_compartments)
-                    compartments_to_scan = [c for c in all_compartments 
-                                         if c.id == compartment.id or 
-                                         (hasattr(c, 'compartment_id') and c.compartment_id == compartment.id)]
-                    print(f"Found {len(compartments_to_scan)} compartments to scan:")
-                    for c in compartments_to_scan:
-                        print(f"  - {compartment_hierarchy.get(c.id, c.name)}")
-                else:
-                    compartments_to_scan = [compartment]
-                    print(f"Scanning single compartment: {compartment.name}")
+            print(f"Initializing OCI clients for region: {region}...")
+            clients = get_service_clients(region_config)
             
             for comp in compartments_to_scan:
                 comp_full_path = get_compartment_full_path(comp.name, comp.id, compartment_hierarchy)
@@ -941,7 +982,7 @@ def main():
                 all_resources.extend(resources)
                 
         except Exception as e:
-            print(f"Error processing profile {profile}: {e}")
+            print(f"Error processing region {region}: {e}")
             continue
     
     print(f"\nResource exploration complete. Found {len(all_resources)} resources across all regions and services.")
