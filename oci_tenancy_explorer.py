@@ -117,15 +117,15 @@ REFERENCE_ATTRIBUTES = [
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='Extract all resources from an OCI compartment using direct API calls')
+    parser = argparse.ArgumentParser(description='OCI Tenancy Explorer - Extract all resources from OCI compartments')
     parser.add_argument('--compartment-name', required=True, help='Name of the compartment to extract resources from')
-    parser.add_argument('--output-file', default=None, help='Output CSV file path (default: compartment_name_resources_timestamp.csv)')
+    parser.add_argument('--recursive', action='store_true', help='Recursively search child compartments')
+    parser.add_argument('--output-file', default='', help='Output CSV file path (default: <compartment_name>_resources_<timestamp>.csv)')
     parser.add_argument('--config-file', default='~/.oci/config', help='OCI config file path (default: ~/.oci/config)')
     parser.add_argument('--profile', default='DEFAULT', help='OCI config profile (default: DEFAULT)')
-    parser.add_argument('--recursive', action='store_true', help='Include child compartments')
-    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of parallel workers (default: 10)')
-    parser.add_argument('--resource-type', help='Scan only a specific resource type (e.g., compute_instances, vcns, buckets)')
-    parser.add_argument('--resource-group', help='Scan only resources in a specific group (e.g., network, compute)')
+    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of worker threads (default: 10)')
+    parser.add_argument('--resource-type', help='Filter by resource type (e.g. "instance", "vcn")')
+    parser.add_argument('--resource-group', help='Filter by resource group')
     return parser.parse_args()
 
 def get_compartment_id_by_name(identity_client, tenancy_id, compartment_name):
@@ -1241,81 +1241,200 @@ def get_all_regions(identity_client, tenancy_id):
         print(f"Error getting regions: {e}")
         return []
 
+def get_config_profiles(config_file):
+    """Read all profiles from OCI config file."""
+    config_file_path = os.path.expanduser(config_file)
+    if not os.path.exists(config_file_path):
+        print(f"Config file not found at {config_file_path}")
+        return []
+    
+    try:
+        from configparser import ConfigParser
+        config_parser = ConfigParser()
+        config_parser.read(config_file_path)
+        return config_parser.sections()
+    except Exception as e:
+        print(f"Error reading config profiles: {e}")
+        return []
+
 def main():
     """Main function."""
     args = parse_arguments()
     start_time = time.time()
     
-    print(f"OCI Tenancy Explorer")
-    print(f"==================")
+    # Set default output file if not specified
+    if not args.output_file:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.output_file = f"{args.compartment_name}_resources_{timestamp}.csv"
     
-    # Get all profiles from config file
+    print(f"OCI Tenancy Explorer (Direct API)")
+    print(f"=============================")
+    
+    # Load OCI configuration
     config_file = os.path.expanduser(args.config_file)
+    
+    # Get profiles from config file
     profiles = get_config_profiles(config_file)
-    print(f"Found profiles: {', '.join(profiles)}")
+    if profiles:
+        print(f"Found profiles: {', '.join(profiles)}")
+    else:
+        print("No profiles found in config file. Using DEFAULT.")
     
-    # Initialize variables
-    all_resources = []
-    tenancy_id = None
-    compartment_hierarchy = {}
-    all_compartments = []
+    # Try to use specified profile or fall back to DEFAULT
+    primary_profile = args.profile if hasattr(args, 'profile') else (profiles[0] if profiles else None)
     
-    # Setup with first profile to get compartment and regions
-    primary_profile = profiles[0] if profiles else "DEFAULT"
     try:
-        config = oci.config.from_file(config_file, primary_profile)
-        print(f"Using profile {primary_profile} to initialize...")
-        identity_client = oci.identity.IdentityClient(config)
-        tenancy_id = config.get('tenancy')
-        
-        print(f"Looking for compartment: {args.compartment_name}")
-        compartment = get_compartment_by_name(identity_client, tenancy_id, args.compartment_name)
-        print(f"Found compartment: {compartment.name}")
-        
-        # Get all regions
-        print("Getting all available regions...")
-        all_regions = get_all_regions(identity_client, tenancy_id)
-        print(f"Will scan the following regions: {', '.join(all_regions)}")
-        
-        # Get compartments
-        compartments_to_scan = []
-        if args.recursive:
-            print("Scanning for child compartments...")
-            all_compartments = get_all_compartments(identity_client, tenancy_id)
-            compartment_hierarchy = build_compartment_hierarchy(identity_client, tenancy_id, all_compartments)
-            compartments_to_scan = [c for c in all_compartments 
-                                if c.id == compartment.id or 
-                                (hasattr(c, 'compartment_id') and c.compartment_id == compartment.id)]
-            print(f"Found {len(compartments_to_scan)} compartments to scan:")
-            for c in compartments_to_scan:
-                print(f"  - {compartment_hierarchy.get(c.id, c.name)}")
+        if primary_profile:
+            config = oci.config.from_file(config_file, primary_profile)
+            print(f"Using profile: {primary_profile}")
         else:
-            compartments_to_scan = [compartment]
-            print(f"Scanning single compartment: {compartment.name}")
+            config = oci.config.from_file(config_file)
+            print("Using DEFAULT profile")
+    except Exception as e:
+        print(f"Error loading OCI configuration: {e}")
+        print("Make sure you have set up the OCI CLI configuration file at ~/.oci/config")
+        sys.exit(1)
+    
+    # Initialize identity client for compartment operations
+    identity_client = oci.identity.IdentityClient(config)
+    
+    # Get tenancy ID from config
+    tenancy_id = config["tenancy"]
+    print(f"Tenancy ID: {tenancy_id}")
+    
+    # Get compartment ID by name
+    try:
+        compartment_id = get_compartment_id_by_name(identity_client, tenancy_id, args.compartment_name)
+        print(f"Found compartment ID: {compartment_id}")
+        # Get the compartment details
+        compartment = identity_client.get_compartment(compartment_id).data
+        compartment_info = {
+            'id': compartment.id,
+            'name': compartment.name,
+            'description': compartment.description if hasattr(compartment, 'description') else 'N/A',
+            'lifecycle_state': compartment.lifecycle_state
+        }
+    except Exception as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
+    # Get all regions
+    print("Getting all available regions...")
+    all_regions = get_all_regions(identity_client, tenancy_id)
+    print(f"Will scan the following regions: {', '.join(all_regions)}")
+    
+    # Get all compartments for hierarchy
+    print("Getting compartment hierarchy...")
+    all_compartments = get_all_compartments(identity_client, tenancy_id)
+    compartment_map = {c.id: c for c in all_compartments}
+    
+    # Determine compartments to scan
+    compartments_to_scan = []
+    if args.recursive:
+        # Add parent compartment
+        compartments_to_scan.append(compartment_id)
         
-        # Process all regions
-        for region in all_regions:
-            print(f"\nSwitching to region: {region}")
-            
+        # Add child compartments
+        child_compartments = [c.id for c in all_compartments 
+                             if hasattr(c, 'compartment_id') and c.compartment_id == compartment_id]
+        compartments_to_scan.extend(child_compartments)
+        
+        print(f"Recursively scanning {args.compartment_name} and {len(child_compartments)} child compartments")
+    else:
+        # Just scan the specified compartment
+        compartments_to_scan.append(compartment_id)
+        print(f"Scanning single compartment: {args.compartment_name}")
+    
+    # Scan each compartment across all regions
+    all_resources_by_type = {}
+    
+    for region in all_regions:
+        print(f"\nSwitching to region: {region}")
+        
+        try:
             # Create new config for this region
             region_config = dict(config)
             region_config['region'] = region
             
-            print(f"Initializing OCI clients for region: {region}...")
-            clients = get_service_clients(region_config)
-            
-            for comp in compartments_to_scan:
-                comp_full_path = get_compartment_full_path(comp.name, comp.id, compartment_hierarchy)
-                print(f"\nExploring compartment: {comp_full_path} in region {region}...")
-                resources = explore_tenancy(comp.id, comp_full_path, clients, region, args.max_workers)
-                all_resources.extend(resources)
+            for comp_id in compartments_to_scan:
+                comp_name = compartment_map[comp_id].name if comp_id in compartment_map else "Unknown"
+                print(f"\nScanning compartment: {comp_name} ({comp_id}) in region {region}")
                 
-    except Exception as e:
-        print(f"Error in main processing: {e}")
-        sys.exit(1)
+                # Scan resources
+                resources_by_type, _ = scan_resources(
+                    region_config, 
+                    comp_id, 
+                    args.resource_type if hasattr(args, 'resource_type') else None,
+                    args.resource_group if hasattr(args, 'resource_group') else None,
+                    args.max_workers
+                )
+                
+                # Merge with existing resources
+                for resource_type, info in resources_by_type.items():
+                    if resource_type in all_resources_by_type:
+                        all_resources_by_type[resource_type]['resources'].extend(info['resources'])
+                        all_resources_by_type[resource_type]['count'] += info['count']
+                    else:
+                        all_resources_by_type[resource_type] = info
+        except Exception as e:
+            print(f"Error processing region {region}: {e}")
+            continue
     
-    print(f"\nResource exploration complete. Found {len(all_resources)} resources across all regions and services.")
-    write_csv(all_resources, args.output_file)
+    # Find cross-compartment references
+    all_resources_by_type = find_cross_compartment_references(all_resources_by_type, compartment_map)
+    
+    # Flatten resources for CSV output
+    flattened_resources = flatten_resources(all_resources_by_type, compartment_info, compartment_map)
+    
+    # Define CSV headers with the correct order
+    base_headers = [
+        'Compartment Name',
+        'Resource Name',
+        'Resource Type',
+        'Service',
+        'Region',
+        'Availability Domain',
+        'Shape',
+        'OCPU Count',
+        'Memory',
+        'Storage Size',
+        'CIDR Block',
+        'Public Access',
+        'Lifecycle State',
+        'Time Created',
+        'Cross-Compartment References',
+        'Resource ID',
+        'Compartment ID',
+        'Defined Tags',
+        'Freeform Tags'
+    ]
+    
+    # Get all field names from all resources, excluding ones we don't want
+    all_fields = set(base_headers)
+    excluded_fields = {'id', 'display_name', 'name', 'resource_group'}
+    for resource in flattened_resources:
+        all_fields.update([k for k in resource.keys() if k not in excluded_fields])
+    
+    # Final headers: base headers first, then any additional fields sorted alphabetically
+    headers = base_headers + sorted(list(all_fields - set(base_headers)))
+    
+    # Write CSV
+    print(f"\nWriting {len(flattened_resources)} resources to {args.output_file}")
+    with open(args.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(flattened_resources)
+    
+    # Print summary
+    total_resources = sum(info['count'] for info in all_resources_by_type.values())
+    
+    print("\nResource counts by type:")
+    for resource_type, info in sorted(all_resources_by_type.items(), key=lambda x: x[1]['display_name']):
+        if info['count'] > 0:
+            print(f"  - {info['display_name']}: {info['count']}")
+    
+    print(f"\nTotal resources: {total_resources}")
+    print(f"Results written to: {args.output_file}")
     
     elapsed_time = time.time() - start_time
     print(f"Total execution time: {elapsed_time:.2f} seconds")
