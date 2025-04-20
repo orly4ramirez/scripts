@@ -1,1009 +1,1384 @@
 #!/usr/bin/env python3
 """
-OCI Tenancy Explorer
+OCI Tenancy Explorer (Direct API Approach)
 
-This script emulates the OCI Tenancy Explorer functionality by recursively discovering
-all resources within a compartment (including child compartments) across all regions
-available in OCI and exporting the results to a CSV file.
+This script extracts all resources from a specified OCI compartment (including child compartments)
+using direct API calls and outputs detailed information to a CSV file.
 
-Usage: python oci_tenancy_explorer.py --compartment-name "your-compartment-name" [--recursive] [--output-file "output.csv"]
+Usage: python oci_tenancy_explorer_direct.py --compartment-name "your-compartment-name" [--output-file "output.csv"] [--recursive]
 """
 
-import argparse
-import csv
 import oci
+import csv
 import sys
 import os
-import time
+import argparse
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from configparser import ConfigParser
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Resource types to check - based on the attachment script
+RESOURCE_TYPES = [
+    # Compute Group
+    ('compute_instances', 'Compute instances', 'compute'),
+    ('dedicated_vm_hosts', 'Dedicated VM hosts', 'compute'),
+    ('boot_volumes', 'Boot volumes', 'compute'),
+    ('block_volumes', 'Block volumes', 'compute'),
+    ('vnics', 'Virtual Network Interfaces', 'compute'),
+    
+    # Network Group
+    ('vcns', 'Virtual Cloud Networks', 'network'),
+    ('subnets', 'Subnets', 'network'),
+    ('security_lists', 'Security lists', 'network'),
+    ('network_security_groups', 'Network security groups', 'network'),
+    ('load_balancers', 'Load balancers', 'network'),
+    ('private_ips', 'Private IPs', 'network'),
+    ('public_ips', 'Public IPs', 'network'),
+    ('nat_gateways', 'NAT Gateways', 'network'),
+    ('internet_gateways', 'Internet Gateways', 'network'),
+    ('route_tables', 'Route Tables', 'network'),
+    ('dhcp_options', 'DHCP Options', 'network'),
+    ('dns_resolvers', 'DNS Resolvers', 'network'),
+    ('dns_views', 'DNS Views', 'network'),
+    
+    # Database Group
+    ('db_systems', 'DB systems', 'database'),
+    ('autonomous_databases', 'Autonomous databases', 'database'),
+    ('autonomous_db_backups', 'Autonomous database backups', 'database'),
+    
+    # Storage Group
+    ('buckets', 'Object storage buckets', 'storage'),
+    ('file_systems', 'File systems', 'storage'),
+    ('sftp_servers', 'SFTP servers', 'storage'),
+    
+    # Security Group
+    ('vaults', 'Vaults', 'security'),
+    ('secrets', 'Secrets', 'security'),
+    ('keys', 'Encryption Keys', 'security'),
+    ('policies', 'Policies', 'security'),
+    
+    # Management Group
+    ('logs', 'Logs', 'management'),
+    ('log_groups', 'Log Groups', 'management'),
+    ('ons_subscriptions', 'Notification Subscriptions', 'management'),
+    ('ons_topics', 'Notification Topics', 'management'),
+    
+    # Integration Group
+    ('integration_instances', 'Integration Cloud instances', 'integration'),
+    ('api_gateways', 'API gateways', 'integration'),
+    
+    # DevOps Build Resources
+    ('build_pipelines', 'Build Pipelines', 'devops'),
+    ('build_runs', 'Build Runs', 'devops'),
+    ('repositories', 'Code Repositories', 'devops'),
+    ('triggers', 'Build Triggers', 'devops'),
+    ('artifacts', 'Build Artifacts', 'devops'),
+]
+
+# Attributes that commonly reference other resources
+REFERENCE_ATTRIBUTES = [
+    'subnet_id', 
+    'vcn_id', 
+    'compartment_id', 
+    'source_id', 
+    'target_id',
+    'vault_id', 
+    'database_id', 
+    'instance_id', 
+    'bucket_name',
+    'network_security_group_id', 
+    'key_id', 
+    'load_balancer_id',
+    'mount_target_id',
+    'file_system_id',
+    'image_id',
+    'volume_id',
+    'boot_volume_id',
+    'drg_id',
+    'route_table_id',
+    'gateway_id',
+    'nat_gateway_id',
+    'internet_gateway_id',
+    'dhcp_options_id',
+    'dns_resolver_id',
+    # Added more reference attributes that might be missed
+    'backup_id',
+    'topic_id',
+    'attachment_id',
+    'private_ip_id',
+    'public_ip_id',
+    'security_list_id',
+    'log_group_id',
+    'log_id',
+    'vnic_id',
+    'endpoint_id',
+    'resource_id',
+]
 
 def parse_arguments():
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description='OCI Tenancy Explorer - Extract all resources from OCI compartments')
+    parser = argparse.ArgumentParser(description='Extract all resources from an OCI compartment using direct API calls')
     parser.add_argument('--compartment-name', required=True, help='Name of the compartment to extract resources from')
-    parser.add_argument('--recursive', action='store_true', help='Recursively search child compartments')
-    parser.add_argument('--output-file', default='oci_resources.csv', help='Output CSV file path (default: oci_resources.csv)')
+    parser.add_argument('--output-file', default=None, help='Output CSV file path (default: compartment_name_resources_timestamp.csv)')
     parser.add_argument('--config-file', default='~/.oci/config', help='OCI config file path (default: ~/.oci/config)')
-    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of worker threads (default: 10)')
-    parser.add_argument('--skip-regions', help='Comma-separated list of regions to skip', default='')
+    parser.add_argument('--profile', default='DEFAULT', help='OCI config profile (default: DEFAULT)')
+    parser.add_argument('--recursive', action='store_true', help='Include child compartments')
+    parser.add_argument('--max-workers', type=int, default=10, help='Maximum number of parallel workers (default: 10)')
+    parser.add_argument('--resource-type', help='Scan only a specific resource type (e.g., compute_instances, vcns, buckets)')
+    parser.add_argument('--resource-group', help='Scan only resources in a specific group (e.g., network, compute)')
     return parser.parse_args()
 
-def get_config_profiles(config_file):
-    """Read all profiles from OCI config file."""
-    config_parser = ConfigParser()
-    config_file_path = os.path.expanduser(config_file)
-    if not os.path.exists(config_file_path):
-        print(f"Config file not found at {config_file_path}")
-        sys.exit(1)
-    
-    config_parser.read(config_file_path)
-    return list(config_parser.sections())
-
-def get_all_compartments(identity_client, tenancy_id, parent_compartment_id=None):
-    """Get all compartments in the tenancy or within a parent compartment."""
+def get_compartment_id_by_name(identity_client, tenancy_id, compartment_name):
+    """Find compartment ID by name."""
+    # Check if it's the root compartment (tenancy)
     try:
-        if parent_compartment_id is None:
-            parent_compartment_id = tenancy_id
-            
-        all_compartments = []
-        
-        # Get tenancy as a compartment
-        if parent_compartment_id == tenancy_id:
-            tenancy = identity_client.get_compartment(tenancy_id).data
-            all_compartments.append(tenancy)
-        
-        # Get all compartments under parent
+        tenancy = identity_client.get_compartment(tenancy_id).data
+        if compartment_name.lower() == tenancy.name.lower():
+            return tenancy_id
+    except Exception as e:
+        print(f"Error checking tenancy: {e}")
+    
+    # List all compartments in the tenancy
+    try:
         compartments = oci.pagination.list_call_get_all_results(
             identity_client.list_compartments,
-            parent_compartment_id,
-            compartment_id_in_subtree=False,
+            compartment_id=tenancy_id,
+            compartment_id_in_subtree=True
+        ).data
+    except Exception as e:
+        print(f"Error listing compartments: {e}")
+        sys.exit(1)
+    
+    # Find the compartment with matching name (case-insensitive)
+    for compartment in compartments:
+        if compartment.name.lower() == compartment_name.lower() and compartment.lifecycle_state == "ACTIVE":
+            return compartment.id
+    
+    # If we get here, the compartment wasn't found
+    raise Exception(f"Compartment '{compartment_name}' not found or not active.")
+
+def get_all_compartments(identity_client, tenancy_id):
+    """Get all compartments in the tenancy."""
+    compartments = []
+    try:
+        # Include the root tenancy
+        tenancy = identity_client.get_compartment(tenancy_id).data
+        compartments.append(tenancy)
+        
+        # Get all other compartments
+        child_compartments = oci.pagination.list_call_get_all_results(
+            identity_client.list_compartments,
+            compartment_id=tenancy_id,
+            compartment_id_in_subtree=True,
             lifecycle_state="ACTIVE"
         ).data
         
-        all_compartments.extend(compartments)
-        
-        # Recursively get children of each compartment
-        for compartment in compartments:
-            child_compartments = get_all_compartments(identity_client, tenancy_id, compartment.id)
-            all_compartments.extend(child_compartments)
-            
-        return all_compartments
+        compartments.extend(child_compartments)
     except Exception as e:
-        print(f"Error listing compartments: {e}")
-        return []
+        print(f"Error getting compartments: {e}")
+    
+    return compartments
 
-def get_compartment_by_name(identity_client, tenancy_id, compartment_name):
-    """Find compartment by name."""
-    try:
-        tenancy = identity_client.get_compartment(tenancy_id).data
-        if tenancy.name == compartment_name:
-            return tenancy
-    except Exception as e:
-        print(f"Error getting tenancy info: {e}")
+def get_compartment_path(compartment_id, compartment_map):
+    """Get the full path of a compartment."""
+    if compartment_id not in compartment_map:
+        return "Unknown"
     
-    all_compartments = get_all_compartments(identity_client, tenancy_id)
-    
-    matching_compartments = [c for c in all_compartments if c.name == compartment_name]
-    
-    if not matching_compartments:
-        print(f"Compartment '{compartment_name}' not found or not accessible")
-        sys.exit(1)
-    
-    if len(matching_compartments) > 1:
-        print(f"Warning: Multiple compartments found with name '{compartment_name}'. Using the first one.")
-        
-    return matching_compartments[0]
+    compartment = compartment_map[compartment_id]
+    if hasattr(compartment, 'compartment_id') and compartment.compartment_id in compartment_map and compartment.compartment_id != compartment_id:
+        parent_path = get_compartment_path(compartment.compartment_id, compartment_map)
+        return f"{parent_path} / {compartment.name}"
+    else:
+        return compartment.name
 
-def get_resources(service_name, resource_type, list_resources_func, compartment_id, region, compartment_name='Unknown'):
-    """Get resources of a specific type with enhanced details."""
-    try:
-        resources = []
-        
-        # Handle special cases
-        if service_name == "Object Storage" and resource_type == "Buckets":
-            namespace = list_resources_func().data
-            bucket_list_func = lambda compartment_id: oci.object_storage.ObjectStorageClient.list_buckets(namespace, compartment_id)
-            resources = oci.pagination.list_call_get_all_results(bucket_list_func, compartment_id).data
-        elif service_name == "Logging" and "Logs" in resource_type:
-            log_group_id = compartment_id
-            resources = oci.pagination.list_call_get_all_results(list_resources_func, log_group_id).data
-        else:
-            resources = oci.pagination.list_call_get_all_results(list_resources_func, compartment_id=compartment_id).data
-        
-        results = []
-        for resource in resources:
-            resource_id = getattr(resource, 'id', 'N/A')
-            
-            resource_name = 'N/A'
-            for name_attr in ['display_name', 'name']:
-                if hasattr(resource, name_attr) and getattr(resource, name_attr) is not None:
-                    resource_name = getattr(resource, name_attr)
-                    break
-            
-            lifecycle_state = getattr(resource, 'lifecycle_state', 'N/A')
-            time_created = getattr(resource, 'time_created', 'N/A')
-            
-            if time_created and time_created != 'N/A':
-                if isinstance(time_created, (datetime, oci.util.datetime_with_timezone)):
-                    time_created = time_created.strftime('%Y-%m-%d %H:%M:%S')
-            
-            ocid_parts = resource_id.split('.') if resource_id != 'N/A' else []
-            resource_region = region or (ocid_parts[3] if len(ocid_parts) > 3 else 'N/A')
-            
-            resource_shape = 'N/A'
-            resource_size = 'N/A'
-            resource_size_unit = ''
-            is_public = 'N/A'
-            cidr_block = 'N/A'
-            ocpu_count = 'N/A'
-            memory_size = 'N/A'
-            parent_resource = 'N/A'
-            parent_compartment = 'N/A'
-            last_modified = 'N/A'
-            cross_compartment_refs = []
-            resource_group = 'N/A'
-            
-            defined_tags = getattr(resource, 'defined_tags', {})
-            if defined_tags and isinstance(defined_tags, dict):
-                if 'Oracle-ResourceGroup' in defined_tags:
-                    rg_tags = defined_tags['Oracle-ResourceGroup']
-                    if isinstance(rg_tags, dict):
-                        if 'resourcegroup' in rg_tags:
-                            resource_group = rg_tags['resourcegroup']
-                        elif 'ResourceGroup' in rg_tags:
-                            resource_group = rg_tags['ResourceGroup']
-                elif 'oracle-resourcegroup' in defined_tags:
-                    rg_tags = defined_tags['oracle-resourcegroup']
-                    if isinstance(rg_tags, dict):
-                        for tag_key, tag_value in rg_tags.items():
-                            if 'resourcegroup' in tag_key.lower():
-                                resource_group = tag_value
-                                break
-            
-            if service_name == "Compute" and resource_type == "Instances":
-                resource_shape = getattr(resource, 'shape', 'N/A')
-                shape_config = getattr(resource, 'shape_config', None)
-                if shape_config:
-                    ocpu_count = getattr(shape_config, 'ocpus', 'N/A')
-                    memory_size = f"{getattr(shape_config, 'memory_in_gbs', 'N/A')} GB"
-                is_public = 'Yes' if hasattr(resource, 'public_ip') and resource.public_ip else 'No'
-                subnet_id = getattr(resource, 'subnet_id', None)
-                if subnet_id:
-                    cross_compartment_refs.append(f"Subnet:{subnet_id}")
-                boot_vol_attachment_id = getattr(resource, 'boot_volume_id', None)
-                if boot_vol_attachment_id:
-                    cross_compartment_refs.append(f"BootVolume:{boot_vol_attachment_id}")
-                    
-            elif service_name == "Block Storage" and resource_type in ["Block Volumes", "Boot Volumes"]:
-                resource_size = f"{getattr(resource, 'size_in_gbs', 'N/A')} GB"
-                resource_size_unit = 'GB'
-                if resource_type == "Block Volumes":
-                    attachment_id = getattr(resource, 'attached_instance_id', None)
-                    if attachment_id:
-                        cross_compartment_refs.append(f"Instance:{attachment_id}")
-                
-            elif service_name == "Networking" and resource_type == "VCNs":
-                cidr_block = getattr(resource, 'cidr_block', 'N/A')
-                
-            elif service_name == "Networking" and resource_type == "Subnets":
-                cidr_block = getattr(resource, 'cidr_block', 'N/A')
-                vcn_id = getattr(resource, 'vcn_id', 'N/A')
-                parent_resource = f"VCN: {vcn_id}"
-                if vcn_id != 'N/A':
-                    cross_compartment_refs.append(f"VCN:{vcn_id}")
-                is_public = 'Yes' if getattr(resource, 'prohibit_public_ip_on_vnic', False) == False else 'No'
-                
-            elif service_name == "Networking" and resource_type in ["Route Tables", "Security Lists", "Network Security Groups"]:
-                vcn_id = getattr(resource, 'vcn_id', 'N/A')
-                parent_resource = f"VCN: {vcn_id}"
-                if vcn_id != 'N/A':
-                    cross_compartment_refs.append(f"VCN:{vcn_id}")
-                
-            elif service_name == "Database" and resource_type == "Autonomous Databases":
-                resource_size = f"{getattr(resource, 'data_storage_size_in_tbs', 'N/A')} TB"
-                resource_size_unit = 'TB'
-                ocpu_count = getattr(resource, 'cpu_core_count', 'N/A')
-                db_version = getattr(resource, 'db_version', 'N/A')
-                resource_shape = f"Autonomous DB v{db_version}" if db_version != 'N/A' else 'N/A'
-                subnet_id = getattr(resource, 'subnet_id', None)
-                if subnet_id:
-                    cross_compartment_refs.append(f"Subnet:{subnet_id}")
-                
-            elif service_name == "Database" and resource_type == "DB Systems":
-                resource_shape = getattr(resource, 'shape', 'N/A')
-                ocpu_count = getattr(resource, 'cpu_core_count', 'N/A')
-                db_version = getattr(resource, 'version', 'N/A')
-                if db_version != 'N/A':
-                    resource_shape = f"{resource_shape} v{db_version}"
-                subnet_id = getattr(resource, 'subnet_id', None)
-                if subnet_id:
-                    cross_compartment_refs.append(f"Subnet:{subnet_id}")
-                    
-            elif service_name == "Object Storage" and resource_type == "Buckets":
-                if hasattr(resource, 'approximate_size'):
-                    approximate_size = getattr(resource, 'approximate_size', 'N/A')
-                    if approximate_size != 'N/A':
-                        size_bytes = int(approximate_size)
-                        if size_bytes > 1024**4:
-                            resource_size = f"{size_bytes/(1024**4):.2f} TB"
-                            resource_size_unit = 'TB'
-                        elif size_bytes > 1024**3:
-                            resource_size = f"{size_bytes/(1024**3):.2f} GB"
-                            resource_size_unit = 'GB'
-                        elif size_bytes > 1024**2:
-                            resource_size = f"{size_bytes/(1024**2):.2f} MB"
-                            resource_size_unit = 'MB'
-                        else:
-                            resource_size = f"{size_bytes} bytes"
-                            resource_size_unit = 'bytes'
-                is_public = 'Yes' if getattr(resource, 'public_access_type', 'NoPublicAccess') != 'NoPublicAccess' else 'No'
-                
-            elif service_name == "Load Balancer" and resource_type == "Load Balancers":
-                resource_shape = getattr(resource, 'shape_name', 'N/A')
-                is_public = 'Yes' if getattr(resource, 'is_private', False) == False else 'No'
-                subnet_ids = getattr(resource, 'subnet_ids', [])
-                for subnet_id in subnet_ids:
-                    if subnet_id:
-                        cross_compartment_refs.append(f"Subnet:{subnet_id}")
-                backend_sets = getattr(resource, 'backend_sets', {})
-                for backend_set_name, backend_set in backend_sets.items():
-                    if hasattr(backend_set, 'backends'):
-                        for backend in backend_set.backends:
-                            if hasattr(backend, 'instance_id') and backend.instance_id:
-                                cross_compartment_refs.append(f"Instance:{backend.instance_id}")
-                
-            elif service_name == "Container Engine" and resource_type == "Clusters":
-                k8s_version = getattr(resource, 'kubernetes_version', 'N/A')
-                resource_shape = f"Kubernetes v{k8s_version}" if k8s_version != 'N/A' else 'N/A'
-                vcn_id = getattr(resource, 'vcn_id', None)
-                if vcn_id:
-                    cross_compartment_refs.append(f"VCN:{vcn_id}")
-            
-            if hasattr(resource, 'time_updated'):
-                last_modified = getattr(resource, 'time_updated', 'N/A')
-                if last_modified and last_modified != 'N/A':
-                    if isinstance(last_modified, (datetime, oci.util.datetime_with_timezone)):
-                        last_modified = last_modified.strftime('%Y-%m-%d %H:%M:%S')
-            
-            details = {}
-            for attr in dir(resource):
-                if not attr.startswith('_') and not callable(getattr(resource, attr)) and attr not in [
-                    'id', 'display_name', 'name', 'lifecycle_state', 'time_created', 'shape', 'shape_config',
-                    'size_in_gbs', 'cidr_block', 'vcn_id', 'data_storage_size_in_tbs', 'cpu_core_count',
-                    'db_version', 'version', 'approximate_size', 'public_access_type', 'is_private',
-                    'kubernetes_version', 'time_updated', 'subnet_id', 'subnet_ids', 'backend_sets',
-                    'defined_tags'
-                ]:
-                    value = getattr(resource, attr)
-                    if isinstance(value, (str, int, float, bool)) or value is None:
-                        details[attr] = value
-            
-            details_str = '; '.join([f"{k}={v}" for k, v in details.items() if v is not None])
-            cross_compartment_str = '; '.join(cross_compartment_refs) if cross_compartment_refs else 'None'
-            
-            results.append({
-                'Compartment Name': compartment_name,
-                'Compartment ID': compartment_id,
-                'Resource Group': resource_group,
-                'Service': service_name,
-                'Resource Type': resource_type,
-                'Resource ID': resource_id,
-                'Name': resource_name,
-                'Region': resource_region,
-                'Availability Domain': getattr(resource, 'availability_domain', 'N/A'),
-                'Shape': resource_shape,
-                'OCPU Count': ocpu_count,
-                'Memory': memory_size,
-                'Storage Size': resource_size,
-                'CIDR Block': cidr_block,
-                'Public Access': is_public,
-                'Parent Resource': parent_resource,
-                'Cross-Compartment References': cross_compartment_str,
-                'Lifecycle State': lifecycle_state,
-                'Time Created': time_created,
-                'Last Modified': last_modified,
-                'Defined Tags': str(getattr(resource, 'defined_tags', {})),
-                'Freeform Tags': str(getattr(resource, 'freeform_tags', {})),
-                'Additional Details': details_str
-            })
-        
-        return results
-    except Exception as e:
-        print(f"Error fetching {service_name} - {resource_type} in region {region}: {e}")
-        return []
-
-def get_service_clients(config):
-    """Initialize all OCI service clients."""
-    clients = {}
-    
-    clients['compute'] = oci.core.ComputeClient(config)
-    clients['network'] = oci.core.VirtualNetworkClient(config)
-    clients['block_storage'] = oci.core.BlockstorageClient(config)
-    clients['object_storage'] = oci.object_storage.ObjectStorageClient(config)
-    clients['database'] = oci.database.DatabaseClient(config)
-    clients['identity'] = oci.identity.IdentityClient(config)
-    clients['load_balancer'] = oci.load_balancer.LoadBalancerClient(config)
-    clients['file_storage'] = oci.file_storage.FileStorageClient(config)
+def extract_resource_group(defined_tags):
+    """Extract resource group from defined tags."""
+    if not defined_tags:
+        return "N/A"
     
     try:
-        clients['search'] = oci.resource_search.ResourceSearchClient(config)
-    except Exception as e:
-        print(f"Error initializing Resource Search client: {e}")
+        if 'Oracle-ResourceGroup' in defined_tags:
+            rg_tags = defined_tags['Oracle-ResourceGroup']
+            if 'resourcegroup' in rg_tags:
+                return rg_tags['resourcegroup']
+            elif 'ResourceGroup' in rg_tags:
+                return rg_tags['ResourceGroup']
+        
+        # Alternative format sometimes used
+        if 'oracle-resourcegroup' in defined_tags:
+            rg_tags = defined_tags['oracle-resourcegroup']
+            for key, value in rg_tags.items():
+                if 'resourcegroup' in key.lower():
+                    return value
+    except Exception:
+        pass
     
-    try:
-        clients['container_engine'] = oci.container_engine.ContainerEngineClient(config)
-        clients['functions'] = oci.functions.FunctionsManagementClient(config)
-        clients['streaming'] = oci.streaming.StreamAdminClient(config)
-        clients['analytics'] = oci.analytics.AnalyticsClient(config)
-        clients['apigateway'] = oci.apigateway.ApiGatewayClient(config)
-        clients['nosql'] = oci.nosql.NosqlClient(config)
-        clients['monitoring'] = oci.monitoring.MonitoringClient(config)
-        clients['dns'] = oci.dns.DnsClient(config)
-        clients['logs'] = oci.logging.LoggingManagementClient(config)
-        clients['data_science'] = oci.data_science.DataScienceClient(config)
-        clients['events'] = oci.events.EventsClient(config)
-        clients['integration'] = oci.integration.IntegrationInstanceClient(config)
-        clients['devops'] = oci.devops.DevopsClient(config)
-        clients['budget'] = oci.budget.BudgetClient(config)
-        clients['bastion'] = oci.bastion.BastionClient(config)
-        clients['audit'] = oci.audit.AuditClient(config)
-        clients['announcements'] = oci.announcements_service.AnnouncementClient(config)
-        clients['usage'] = oci.usage_api.UsageapiClient(config)
-        clients['email'] = oci.email.EmailClient(config)
-        clients['data_catalog'] = oci.data_catalog.DataCatalogClient(config)
-    except Exception as e:
-        print(f"Warning: Some service clients could not be initialized: {e}")
-    
-    return clients
+    return "N/A"
 
-def define_resource_tasks(clients, compartment_id, region):
-    """Define all resource extraction tasks."""
-    resource_tasks = []
+def extract_resource_details(resource, compartments=None, resource_type='Unknown', service_group='Unknown'):
+    """
+    Extract key details from a resource object.
     
-    service_resources = {
-        "Compute": [
-            ("Instances", clients['compute'].list_instances),
-            ("Images", clients['compute'].list_images),
-            ("Boot Volume Attachments", clients['compute'].list_boot_volume_attachments),
-            ("Volume Attachments", clients['compute'].list_volume_attachments),
-            ("Instance Configurations", clients['compute'].list_instance_configurations if hasattr(clients['compute'], 'list_instance_configurations') else None),
-            ("Instance Pools", clients['compute'].list_instance_pools if hasattr(clients['compute'], 'list_instance_pools') else None),
-            ("Dedicated VM Hosts", clients['compute'].list_dedicated_vm_hosts if hasattr(clients['compute'], 'list_dedicated_vm_hosts') else None),
-            ("Cluster Networks", clients['compute'].list_cluster_networks if hasattr(clients['compute'], 'list_cluster_networks') else None),
-            ("Compute Capacity Reports", clients['compute'].list_compute_capacity_reports if hasattr(clients['compute'], 'list_compute_capacity_reports') else None),
-        ],
-        "Block Storage": [
-            ("Block Volumes", clients['block_storage'].list_volumes),
-            ("Boot Volumes", clients['block_storage'].list_boot_volumes),
-            ("Volume Backups", clients['block_storage'].list_volume_backups),
-            ("Volume Groups", clients['block_storage'].list_volume_groups if hasattr(clients['block_storage'], 'list_volume_groups') else None),
-            ("Volume Group Backups", clients['block_storage'].list_volume_group_backups if hasattr(clients['block_storage'], 'list_volume_group_backups') else None),
-        ],
-        "Networking": [
-            ("VCNs", clients['network'].list_vcns),
-            ("Subnets", clients['network'].list_subnets),
-            ("Internet Gateways", clients['network'].list_internet_gateways),
-            ("NAT Gateways", clients['network'].list_nat_gateways),
-            ("Service Gateways", clients['network'].list_service_gateways),
-            ("Local Peering Gateways", clients['network'].list_local_peering_gateways),
-            ("Route Tables", clients['network'].list_route_tables),
-            ("Security Lists", clients['network'].list_security_lists),
-            ("Network Security Groups", clients['network'].list_network_security_groups),
-            ("DHCP Options", clients['network'].list_dhcp_options),
-            ("DRGs", clients['network'].list_drgs),
-            ("IPSec Connections", clients['network'].list_ip_sec_connections),
-            ("Public IPs", clients['network'].list_public_ips),
-            ("VLANs", clients['network'].list_vlans if hasattr(clients['network'], 'list_vlans') else None),
-            ("Virtual Circuits", clients['network'].list_virtual_circuits if hasattr(clients['network'], 'list_virtual_circuits') else None),
-        ],
-        "Database": [
-            ("DB Systems", clients['database'].list_db_systems),
-            ("Autonomous Databases", clients['database'].list_autonomous_databases),
-            ("Autonomous Database Backups", clients['database'].list_autonomous_database_backups),
-            ("DB Backups", clients['database'].list_backups),
-            ("Exadata Infrastructures", clients['database'].list_exadata_infrastructures if hasattr(clients['database'], 'list_exadata_infrastructures') else None),
-            ("Autonomous Container Databases", clients['database'].list_autonomous_container_databases if hasattr(clients['database'], 'list_autonomous_container_databases') else None),
-            ("Autonomous VM Clusters", clients['database'].list_autonomous_vm_clusters if hasattr(clients['database'], 'list_autonomous_vm_clusters') else None),
-            ("DB Homes", clients['database'].list_db_homes if hasattr(clients['database'], 'list_db_homes') else None),
-        ],
-        "Object Storage": [
-            ("Buckets", clients['object_storage'].get_namespace),
-        ],
-        "File Storage": [
-            ("File Systems", clients['file_storage'].list_file_systems),
-            ("Mount Targets", clients['file_storage'].list_mount_targets),
-            ("Export Sets", clients['file_storage'].list_export_sets),
-        ],
-        "Load Balancer": [
-            ("Load Balancers", clients['load_balancer'].list_load_balancers),
-        ],
-    }
-    
-    if 'container_engine' in clients:
-        service_resources["Container Engine"] = [
-            ("Clusters", clients['container_engine'].list_clusters),
-            ("Node Pools", clients['container_engine'].list_node_pools),
-        ]
-    
-    if 'functions' in clients:
-        service_resources["Functions"] = [
-            ("Applications", clients['functions'].list_applications),
-        ]
-    
-    if 'streaming' in clients:
-        service_resources["Streaming"] = [
-            ("Stream Pools", clients['streaming'].list_stream_pools if hasattr(clients['streaming'], 'list_stream_pools') else None),
-        ]
-    
-    if 'analytics' in clients:
-        service_resources["Analytics"] = [
-            ("Analytics Instances", clients['analytics'].list_analytics_instances if hasattr(clients['analytics'], 'list_analytics_instances') else None),
-        ]
-    
-    if 'apigateway' in clients:
-        service_resources["API Gateway"] = [
-            ("Gateways", clients['apigateway'].list_gateways if hasattr(clients['apigateway'], 'list_gateways') else None),
-            ("Deployments", clients['apigateway'].list_deployments if hasattr(clients['apigateway'], 'list_deployments') else None),
-        ]
-    
-    if 'nosql' in clients:
-        service_resources["NoSQL"] = [
-            ("Tables", clients['nosql'].list_tables if hasattr(clients['nosql'], 'list_tables') else None),
-        ]
-    
-    if 'monitoring' in clients:
-        service_resources["Monitoring"] = [
-            ("Alarms", clients['monitoring'].list_alarms if hasattr(clients['monitoring'], 'list_alarms') else None),
-        ]
-    
-    if 'dns' in clients:
-        service_resources["DNS"] = [
-            ("Zones", clients['dns'].list_zones if hasattr(clients['dns'], 'list_zones') else None),
-        ]
-    
-    if 'data_science' in clients:
-        service_resources["Data Science"] = [
-            ("Projects", clients['data_science'].list_projects if hasattr(clients['data_science'], 'list_projects') else None),
-            ("Notebook Sessions", clients['data_science'].list_notebook_sessions if hasattr(clients['data_science'], 'list_notebook_sessions') else None),
-            ("Models", clients['data_science'].list_models if hasattr(clients['data_science'], 'list_models') else None),
-        ]
-    
-    if 'events' in clients:
-        service_resources["Events"] = [
-            ("Rules", clients['events'].list_rules if hasattr(clients['events'], 'list_rules') else None),
-        ]
-    
-    if 'devops' in clients:
-        service_resources["DevOps"] = [
-            ("Projects", clients['devops'].list_projects if hasattr(clients['devops'], 'list_projects') else None),
-        ]
-    
-    if 'budget' in clients:
-        service_resources["Budget"] = [
-            ("Budgets", clients['budget'].list_budgets if hasattr(clients['budget'], 'list_budgets') else None),
-        ]
-    
-    if 'bastion' in clients:
-        service_resources["Bastion"] = [
-            ("Bastions", clients['bastion'].list_bastions if hasattr(clients['bastion'], 'list_bastions') else None),
-        ]
-    
-    if 'email' in clients:
-        service_resources["Email"] = [
-            ("Senders", clients['email'].list_senders if hasattr(clients['email'], 'list_senders') else None),
-            ("Suppressions", clients['email'].list_suppressions if hasattr(clients['email'], 'list_suppressions') else None),
-        ]
-    
-    if 'data_catalog' in clients:
-        service_resources["Data Catalog"] = [
-            ("Catalogs", clients['data_catalog'].list_catalogs if hasattr(clients['data_catalog'], 'list_catalogs') else None),
-        ]
-    
-    for service_name, resources in service_resources.items():
-        for resource_type, list_func in resources:
-            if list_func is not None:
-                resource_tasks.append((service_name, resource_type, list_func, compartment_id, region))
-    
-    if 'logs' in clients:
-        try:
-            log_groups = oci.pagination.list_call_get_all_results(
-                clients['logs'].list_log_groups,
-                compartment_id=compartment_id
-            ).data
-            
-            for log_group in log_groups:
-                try:
-                    resource_tasks.append(
-                        ("Logging", f"Logs (Group: {log_group.display_name})",
-                         lambda log_group_id=log_group.id: clients['logs'].list_logs(log_group_id),
-                         log_group.id, region)
-                    )
-                except Exception as e:
-                    print(f"Error setting up log listing for {log_group.display_name} in region {region}: {e}")
-        except Exception as e:
-            print(f"Error listing log groups in region {region}: {e}")
-    
-    return resource_tasks
-
-def map_resource_type_to_service(resource_type, clients):
-    """Map an OCI resource type to a service client and method."""
-    resource_type_map = {
-        "instance": ("Compute", clients['compute'].list_instances),
-        "image": ("Compute", clients['compute'].list_images),
-        "bootvolume": ("Block Storage", clients['block_storage'].list_boot_volumes),
-        "volume": ("Block Storage", clients['block_storage'].list_volumes),
-        "vcn": ("Networking", clients['network'].list_vcns),
-        "subnet": ("Networking", clients['network'].list_subnets),
-        "internetgateway": ("Networking", clients['network'].list_internet_gateways),
-        "natgateway": ("Networking", clients['network'].list_nat_gateways),
-        "servicegateway": ("Networking", clients['network'].list_service_gateways),
-        "routetable": ("Networking", clients['network'].list_route_tables),
-        "securitylist": ("Networking", clients['network'].list_security_lists),
-        "networksecuritygroup": ("Networking", clients['network'].list_network_security_groups),
-        "dbsystem": ("Database", clients['database'].list_db_systems),
-        "autonomousdatabase": ("Database", clients['database'].list_autonomous_databases),
-        "filesystem": ("File Storage", clients['file_storage'].list_file_systems),
-        "mounttarget": ("File Storage", clients['file_storage'].list_mount_targets),
-        "loadbalancer": ("Load Balancer", clients['load_balancer'].list_load_balancers),
-    }
-    
-    resource_type_lower = resource_type.lower()
-    for key, (service, method) in resource_type_map.items():
-        if key in resource_type_lower:
-            return service, method
-    
-    return None, None
-
-def get_all_regions(identity_client):
-    """Get all available regions in OCI."""
-    try:
-        tenancy_id = identity_client.tenancy_id
-        regions = identity_client.list_region_subscriptions(tenancy_id).data
-        return [region.region_name for region in regions]
-    except Exception as e:
-        print(f"Error getting regions: {e}")
-        return []
-
-def explore_tenancy(compartment_id, compartment_name, clients, region, max_workers=10):
-    """Explore a compartment using Resource Search API + detailed service calls."""
-    all_resources = []
-    
-    if 'search' in clients:
-        print(f"\nDiscovering all resources in {compartment_name} ({region}) using Resource Search API...")
-        search_client = clients['search']
+    Args:
+        resource: An OCI resource object
+        compartments: Dictionary of compartment objects (optional)
+        resource_type: Type of resource for categorization
+        service_group: Service group for categorization
         
-        query = f"query all resources where compartmentId = '{compartment_id}'"
-        search_details = oci.resource_search.models.StructuredSearchDetails(
-            type="Structured",
-            query=query
-        )
-        
-        try:
-            response = oci.pagination.list_call_get_all_results(
-                search_client.search_resources,
-                search_details=search_details,
-                limit=1000
-            )
-            
-            discovered_resources = response.data.items
-            print(f"Resource Search found {len(discovered_resources)} resources in {compartment_name} ({region})")
-            
-            resource_type_counts = {}
-            for resource in discovered_resources:
-                resource_type = resource.resource_type
-                resource_type_counts[resource_type] = resource_type_counts.get(resource_type, 0) + 1
-            
-            print(f"Resource types found in {region}:")
-            for resource_type, count in resource_type_counts.items():
-                print(f"  - {resource_type}: {count}")
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for resource in discovered_resources:
-                    resource_type = resource.resource_type
-                    resource_id = resource.identifier
-                    resource_name = resource.display_name if hasattr(resource, 'display_name') and resource.display_name else 'unnamed'
-                    future = executor.submit(
-                        extract_resource_details,
-                        clients, 
-                        resource_type, 
-                        resource_id, 
-                        compartment_id, 
-                        compartment_name,
-                        region
-                    )
-                    futures.append((future, resource_type, resource_name))
-                
-                completed = 0
-                total = len(futures)
-                for future, resource_type, resource_name in futures:
-                    try:
-                        resource_details = future.result()
-                        completed += 1
-                        if resource_details:
-                            all_resources.append(resource_details)
-                            print(f"[{completed}/{total}] {resource_type}: {resource_details.get('Name', resource_name)} ({region})")
-                        else:
-                            print(f"[{completed}/{total}] {resource_type}: {resource_name} - Could not extract details ({region})")
-                    except Exception as e:
-                        completed += 1
-                        print(f"[{completed}/{total}] Error processing {resource_type}: {resource_name} in {region}: {str(e)[:100]}")
-            
-            return all_resources
-            
-        except Exception as e:
-            print(f"Error using Resource Search API in {region}: {e}")
-            print(f"Falling back to conventional resource discovery in {region}...")
+    Returns:
+        dict: Dictionary with key resource details
+    """
+    details = {}
     
-    resource_tasks = define_resource_tasks(clients, compartment_id, region)
-    
-    print(f"\nFalling back to conventional resource discovery in {compartment_name} ({region})...")
-    print(f"Found {len(resource_tasks)} resource types to scan")
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for service_name, resource_type, list_func, cid, region in resource_tasks:
-            future = executor.submit(get_resources, service_name, resource_type, list_func, cid, region, compartment_name)
-            futures.append((future, service_name, resource_type))
-        
-        completed = 0
-        for future, service_name, resource_type in futures:
-            try:
-                resources = future.result()
-                completed += 1
-                resource_count = len(resources)
-                if resource_count > 0:
-                    resource_names = [r.get('Name', 'unnamed') for r in resources[:3]]
-                    name_display = ", ".join(resource_names)
-                    if len(resources) > 3:
-                        name_display += f" and {len(resources)-3} more..."
-                    print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found - {name_display} ({region})")
-                else:
-                    print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: {resource_count} found ({region})")
-                all_resources.extend(resources)
-            except Exception as e:
-                print(f"[{completed}/{len(futures)}] {service_name}/{resource_type}: Error - {str(e)[:100]} ({region})")
-                completed += 1
-    
-    return all_resources
-
-def extract_resource_details(clients, resource_type, resource_id, compartment_id, compartment_name, region):
-    """Extract detailed information for a specific resource."""
-    try:
-        client, get_method = get_detail_method_for_resource_type(clients, resource_type)
-        
-        if not client or not get_method:
-            return {
-                'Compartment Name': compartment_name,
-                'Compartment ID': compartment_id,
-                'Resource Group': 'N/A',
-                'Service': resource_type.split('.')[0] if '.' in resource_type else 'Unknown',
-                'Resource Type': resource_type,
-                'Resource ID': resource_id,
-                'Name': resource_id.split('.')[-1] if '.' in resource_id else resource_id,
-                'Region': region,
-                'Availability Domain': 'N/A',
-                'Shape': 'N/A',
-                'OCPU Count': 'N/A',
-                'Memory': 'N/A',
-                'Storage Size': 'N/A',
-                'CIDR Block': 'N/A',
-                'Public Access': 'N/A',
-                'Parent Resource': 'N/A',
-                'Cross-Compartment References': 'N/A',
-                'Lifecycle State': 'UNKNOWN',
-                'Time Created': 'N/A',
-                'Last Modified': 'N/A',
-                'Defined Tags': '{}',
-                'Freeform Tags': '{}',
-                'Additional Details': f"Resource details not available for type: {resource_type}"
-            }
-        
-        resource_details = get_method(resource_id)
-        
-        display_name = getattr(resource_details, 'display_name', getattr(resource_details, 'name', 'N/A'))
-        lifecycle_state = getattr(resource_details, 'lifecycle_state', 'N/A')
-        time_created = getattr(resource_details, 'time_created', 'N/A')
-        if time_created and time_created != 'N/A' and hasattr(time_created, 'strftime'):
-            time_created = time_created.strftime('%Y-%m-%d %H:%M:%S')
-            
-        defined_tags = getattr(resource_details, 'defined_tags', {})
-        freeform_tags = getattr(resource_details, 'freeform_tags', {})
-        availability_domain = getattr(resource_details, 'availability_domain', 'N/A')
-        
-        resource_group = 'N/A'
-        if defined_tags and isinstance(defined_tags, dict):
-            if 'Oracle-ResourceGroup' in defined_tags:
-                rg_tags = defined_tags['Oracle-ResourceGroup']
-                if isinstance(rg_tags, dict):
-                    if 'resourcegroup' in rg_tags:
-                        resource_group = rg_tags['resourcegroup']
-                    elif 'ResourceGroup' in rg_tags:
-                        resource_group = rg_tags['ResourceGroup']
-        
-        resource_shape = 'N/A'
-        ocpu_count = 'N/A'
-        memory_size = 'N/A'
-        storage_size = 'N/A'
-        cidr_block = 'N/A'
-        is_public = 'N/A'
-        parent_resource = 'N/A'
-        cross_compartment_refs = []
-        
-        if 'instance' in resource_type.lower():
-            resource_shape = getattr(resource_details, 'shape', 'N/A')
-            shape_config = getattr(resource_details, 'shape_config', None)
-            if shape_config:
-                ocpu_count = getattr(shape_config, 'ocpus', 'N/A')
-                memory_size = f"{getattr(shape_config, 'memory_in_gbs', 'N/A')} GB"
-            is_public = 'Yes' if hasattr(resource_details, 'public_ip') and resource_details.public_ip else 'No'
-                
-        elif 'volume' in resource_type.lower():
-            storage_size = f"{getattr(resource_details, 'size_in_gbs', 'N/A')} GB"
-            
-        elif 'vcn' in resource_type.lower():
-            cidr_block = getattr(resource_details, 'cidr_block', 'N/A')
-            
-        elif 'subnet' in resource_type.lower():
-            cidr_block = getattr(resource_details, 'cidr_block', 'N/A')
-            vcn_id = getattr(resource_details, 'vcn_id', 'N/A')
-            parent_resource = f"VCN: {vcn_id}"
-            is_public = 'Yes' if getattr(resource_details, 'prohibit_public_ip_on_vnic', False) == False else 'No'
-            
-        elif 'autonomousdatabase' in resource_type.lower():
-            storage_size = f"{getattr(resource_details, 'data_storage_size_in_tbs', 'N/A')} TB"
-            ocpu_count = getattr(resource_details, 'cpu_core_count', 'N/A')
-            db_version = getattr(resource_details, 'db_version', 'N/A')
-            resource_shape = f"Autonomous DB v{db_version}" if db_version != 'N/A' else 'N/A'
-            
-        last_modified = 'N/A'
-        if hasattr(resource_details, 'time_updated'):
-            time_updated = getattr(resource_details, 'time_updated', 'N/A')
-            if time_updated and time_updated != 'N/A' and hasattr(time_updated, 'strftime'):
-                last_modified = time_updated.strftime('%Y-%m-%d %H:%M:%S')
-                
-        additional_details = {}
-        for attr in dir(resource_details):
-            if not attr.startswith('_') and not callable(getattr(resource_details, attr)) and attr not in [
-                'id', 'display_name', 'name', 'lifecycle_state', 'time_created', 'defined_tags',
-                'freeform_tags', 'availability_domain', 'shape', 'shape_config', 'size_in_gbs',
-                'cidr_block', 'vcn_id', 'data_storage_size_in_tbs', 'cpu_core_count', 'db_version',
-                'time_updated', 'public_ip', 'prohibit_public_ip_on_vnic'
-            ]:
-                value = getattr(resource_details, attr)
-                if isinstance(value, (str, int, float, bool)) or value is None:
-                    additional_details[attr] = value
-                    
-        additional_details_str = '; '.join([f"{k}={v}" for k, v in additional_details.items() if v is not None])
-        cross_compartment_str = '; '.join(cross_compartment_refs) if cross_compartment_refs else 'None'
-        
-        return {
-            'Compartment Name': compartment_name,
-            'Compartment ID': compartment_id,
-            'Resource Group': resource_group,
-            'Service': resource_type.split('.')[0] if '.' in resource_type else resource_type,
-            'Resource Type': resource_type,
-            'Resource ID': resource_id,
-            'Name': display_name,
-            'Region': region,
-            'Availability Domain': availability_domain,
-            'Shape': resource_shape,
-            'OCPU Count': ocpu_count,
-            'Memory': memory_size,
-            'Storage Size': storage_size,
-            'CIDR Block': cidr_block,
-            'Public Access': is_public,
-            'Parent Resource': parent_resource,
-            'Cross-Compartment References': cross_compartment_str,
-            'Lifecycle State': lifecycle_state,
-            'Time Created': time_created,
-            'Last Modified': last_modified,
-            'Defined Tags': str(defined_tags),
-            'Freeform Tags': str(freeform_tags),
-            'Additional Details': additional_details_str
-        }
-        
-    except Exception as e:
-        print(f"Error extracting details for {resource_type} in {region}: {e}")
-        return None
-
-def get_detail_method_for_resource_type(clients, resource_type):
-    """Map a resource type to the appropriate client and get method."""
-    resource_type_lower = resource_type.lower()
-    
-    mappings = {
-        'instance': (clients.get('compute'), 
-                    lambda id: clients['compute'].get_instance(id).data),
-        'volume': (clients.get('block_storage'), 
-                  lambda id: clients['block_storage'].get_volume(id).data),
-        'bootvolumeattachment': (clients.get('compute'), 
-                                lambda id: clients['compute'].get_boot_volume_attachment(id).data),
-        'volumeattachment': (clients.get('compute'), 
-                            lambda id: clients['compute'].get_volume_attachment(id).data),
-        'vcn': (clients.get('network'), 
-               lambda id: clients['network'].get_vcn(id).data),
-        'subnet': (clients.get('network'), 
-                  lambda id: clients['network'].get_subnet(id).data),
-        'internetgateway': (clients.get('network'), 
-                           lambda id: clients['network'].get_internet_gateway(id).data),
-        'routetable': (clients.get('network'), 
-                      lambda id: clients['network'].get_route_table(id).data),
-        'securitylist': (clients.get('network'), 
-                        lambda id: clients['network'].get_security_list(id).data),
-        'networksecuritygroup': (clients.get('network'), 
-                                lambda id: clients['network'].get_network_security_group(id).data),
-        'autonomousdatabase': (clients.get('database'), 
-                              lambda id: clients['database'].get_autonomous_database(id).data),
-        'dbsystem': (clients.get('database'), 
-                    lambda id: clients['database'].get_db_system(id).data),
-        'filesystem': (clients.get('file_storage'), 
-                      lambda id: clients['file_storage'].get_file_system(id).data),
-        'mounttarget': (clients.get('file_storage'), 
-                       lambda id: clients['file_storage'].get_mount_target(id).data),
-        'loadbalancer': (clients.get('load_balancer'), 
-                        lambda id: clients['load_balancer'].get_load_balancer(id).data),
-    }
-    
-    for key, (client, method) in mappings.items():
-        if key in resource_type_lower:
-            if client:
-                return client, method
-    
-    return None, None
-
-def write_csv(resources, output_file):
-    """Write resources to CSV file."""
-    if not resources:
-        print("No resources found to write to CSV.")
-        return
-    
-    fieldnames = [
-        'Compartment Name', 'Name', 'Resource Group', 'Compartment ID', 'Service', 'Resource Type', 'Resource ID',
-        'Region', 'Availability Domain', 'Shape', 'OCPU Count', 'Memory', 'Storage Size', 
-        'CIDR Block', 'Public Access', 'Parent Resource', 'Cross-Compartment References', 'Lifecycle State', 
-        'Time Created', 'Last Modified', 'Defined Tags', 'Freeform Tags', 'Additional Details'
+    # Common attributes to check
+    common_attrs = [
+        'id', 'display_name', 'name', 'lifecycle_state', 'time_created',
+        'compartment_id', 'availability_domain', 'shape', 'size_in_gbs',
+        'hostname', 'domain', 'size_in_mbs', 'ip_address', 'cidr_block',
+        'vcn_id', 'subnet_id', 'public_ip', 'private_ip', 'status'
     ]
     
-    try:
-        with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(resources)
-        print(f"Resource inventory successfully written to {output_file}")
-    except Exception as e:
-        print(f"Error writing to CSV file: {e}")
+    # Extract common attributes
+    for attr in common_attrs:
+        if hasattr(resource, attr) and getattr(resource, attr) is not None:
+            value = getattr(resource, attr)
+            # Convert datetime objects to strings
+            if isinstance(value, datetime):
+                value = value.isoformat()
+            details[attr] = value
+    
+    # Check for lifecycle state in multiple attributes
+    state_attrs = ['lifecycle_state', 'status', 'state', 'resource_state', 'state_code']
+    lifecycle_state_found = False
+    
+    for state_attr in state_attrs:
+        if hasattr(resource, state_attr) and getattr(resource, state_attr):
+            details['lifecycle_state'] = getattr(resource, state_attr)
+            lifecycle_state_found = True
+            break
+    
+    if not lifecycle_state_found:
+        details['lifecycle_state'] = 'N/A'
+    
+    # Add compartment name if possible
+    if compartments and hasattr(resource, 'compartment_id') and resource.compartment_id in compartments:
+        details['compartment_name'] = compartments[resource.compartment_id].name
+    
+    # Extract resource ID - use the most appropriate field
+    if 'id' in details:
+        details['resource_id'] = details['id']
+    elif hasattr(resource, 'identifier'):
+        details['resource_id'] = resource.identifier
+    else:
+        details['resource_id'] = 'N/A'
+    
+    # Extract display name
+    if 'display_name' in details:
+        details['resource_name'] = details['display_name']
+    elif 'name' in details:
+        details['resource_name'] = details['name']
+    elif hasattr(resource, 'display_name') and resource.display_name:
+        details['resource_name'] = resource.display_name
+    elif hasattr(resource, 'name') and resource.name:
+        details['resource_name'] = resource.name
+    else:
+        details['resource_name'] = 'Unnamed'
+    
+    # Add resource type and service information
+    details['resource_type'] = resource_type
+    details['service'] = service_group
+    
+    # Extract freeform and defined tags if available
+    if hasattr(resource, 'freeform_tags') and resource.freeform_tags:
+        details['freeform_tags'] = resource.freeform_tags
+        
+    if hasattr(resource, 'defined_tags') and resource.defined_tags:
+        details['defined_tags'] = resource.defined_tags
+        
+        # Extract resource group from defined tags
+        details['resource_group'] = extract_resource_group(resource.defined_tags)
+    else:
+        details['resource_group'] = 'N/A'
+        
+    # Extract region if available in the resource ID
+    if details['resource_id'] != 'N/A':
+        parts = details['resource_id'].split('.')
+        if len(parts) > 3:
+            details['region'] = parts[3]
+        else:
+            details['region'] = 'N/A'
+    else:
+        details['region'] = 'N/A'
+        
+    # Format time created
+    if 'time_created' in details and details['time_created']:
+        if isinstance(details['time_created'], str):
+            # Keep it as is if already a string
+            pass
+        else:
+            # Convert to string format if it's a datetime object
+            try:
+                details['time_created'] = details['time_created'].strftime('%Y-%m-%d %H:%M:%S')
+            except:
+                details['time_created'] = str(details['time_created'])
+    else:
+        details['time_created'] = 'N/A'
+    
+    # Initialize cross-compartment references
+    details['cross_compartment_references'] = 'None'
+    
+    # Get compute-specific info
+    if resource_type == 'Compute instances':
+        # Ensure shape info
+        details['shape'] = getattr(resource, 'shape', 'N/A')
+        
+        # Get OCPU count and memory if available
+        shape_config = getattr(resource, 'shape_config', None)
+        if shape_config:
+            details['ocpu_count'] = getattr(shape_config, 'ocpus', 'N/A')
+            details['memory'] = f"{getattr(shape_config, 'memory_in_gbs', 'N/A')} GB"
+        else:
+            details['ocpu_count'] = 'N/A'
+            details['memory'] = 'N/A'
+            
+        # Public access
+        details['public_access'] = 'Yes' if getattr(resource, 'public_ip', None) else 'No'
+        
+    # Get network-specific info
+    elif resource_type in ['Virtual Cloud Networks', 'Subnets']:
+        details['cidr_block'] = getattr(resource, 'cidr_block', 'N/A')
+        if resource_type == 'Subnets':
+            details['public_access'] = 'No' if getattr(resource, 'prohibit_public_ip_on_vnic', False) else 'Yes'
+        else:
+            details['public_access'] = 'N/A'
+            
+    # Get storage-specific info
+    elif resource_type in ['Block volumes', 'Boot volumes']:
+        details['storage_size'] = f"{getattr(resource, 'size_in_gbs', 'N/A')} GB"
+        
+    # Get database-specific info
+    elif resource_type in ['DB systems', 'Autonomous databases']:
+        if resource_type == 'Autonomous databases':
+            details['storage_size'] = f"{getattr(resource, 'data_storage_size_in_tbs', 'N/A')} TB"
+            details['ocpu_count'] = getattr(resource, 'cpu_core_count', 'N/A')
+        else:
+            details['storage_size'] = f"{getattr(resource, 'data_storage_size_in_gbs', 'N/A')} GB"
+            details['ocpu_count'] = getattr(resource, 'cpu_core_count', 'N/A')
+    
+    return details
 
-def get_compartment_path(identity_client, compartment, compartments_by_id):
-    """Recursive function to build compartment path."""
-    if compartment.id in compartments_by_id and compartment.compartment_id:
-        parent = compartments_by_id.get(compartment.compartment_id)
-        if parent:
-            return get_compartment_path(identity_client, parent, compartments_by_id) + " / " + compartment.name
-    return compartment.name
-
-def build_compartment_hierarchy(identity_client, tenancy_id, compartments):
-    """Build compartment hierarchy paths for all compartments."""
-    compartments_by_id = {c.id: c for c in compartments}
+def get_resource_details(config, compartment_id, resource_spec, compartments=None):
+    """Get detailed information about resources of a specific type in the compartment."""
+    resource_type, resource_display, resource_group = resource_spec
+    resources = []
+    
+    # Print the resource type being scanned
+    print(f"Scanning {resource_display}...", end=" ")
     
     try:
-        tenancy = identity_client.get_compartment(tenancy_id).data
-        compartments_by_id[tenancy_id] = tenancy
-    except Exception as e:
-        print(f"Error getting tenancy details: {e}")
-    
-    hierarchy = {}
-    for compartment in compartments:
-        path = get_compartment_path(identity_client, compartment, compartments_by_id)
-        hierarchy[compartment.id] = path
-    
-    return hierarchy
+        # COMPUTE RESOURCES
+        if resource_type == 'compute_instances':
+            client = oci.core.ComputeClient(config)
+            instances = oci.pagination.list_call_get_all_results(
+                client.list_instances, compartment_id=compartment_id
+            ).data
+            for instance in instances:
+                resource_details = extract_resource_details(instance, compartments, resource_display, resource_group)
+                resources.append(resource_details)
+                
+        elif resource_type == 'dedicated_vm_hosts':
+            client = oci.core.ComputeClient(config)
+            hosts = oci.pagination.list_call_get_all_results(
+                client.list_dedicated_vm_hosts, compartment_id=compartment_id
+            ).data
+            for host in hosts:
+                resources.append(extract_resource_details(host, compartments, resource_display, resource_group))
+                
+        elif resource_type == 'vnics':
+            # VNICs are typically accessed through compute instances
+            client = oci.core.ComputeClient(config)
+            network_client = oci.core.VirtualNetworkClient(config)
+            
+            # First get all instances
+            instances = oci.pagination.list_call_get_all_results(
+                client.list_instances, compartment_id=compartment_id
+            ).data
+            
+            for instance in instances:
+                # Get the VNIC attachments for each instance
+                vnic_attachments = oci.pagination.list_call_get_all_results(
+                    client.list_vnic_attachments,
+                    compartment_id=compartment_id,
+                    instance_id=instance.id
+                ).data
+                
+                for attachment in vnic_attachments:
+                    if attachment.lifecycle_state == "ATTACHED":
+                        try:
+                            vnic = network_client.get_vnic(attachment.vnic_id).data
+                            resource_details = extract_resource_details(vnic, compartments, resource_display, resource_group)
+                            resource_details['instance_id'] = instance.id
+                            resource_details['instance_name'] = instance.display_name
+                            resources.append(resource_details)
+                        except Exception as e:
+                            # Skip this VNIC if there's an error
+                            pass
+                
+        elif resource_type == 'boot_volumes':
+            client = oci.core.BlockstorageClient(config)
+            # Need to iterate through all ADs
+            identity_client = oci.identity.IdentityClient(config)
+            ads = oci.pagination.list_call_get_all_results(
+                identity_client.list_availability_domains, compartment_id=compartment_id
+            ).data
+            
+            for ad in ads:
+                volumes = oci.pagination.list_call_get_all_results(
+                    client.list_boot_volumes,
+                    availability_domain=ad.name,
+                    compartment_id=compartment_id
+                ).data
+                for volume in volumes:
+                    resources.append(extract_resource_details(volume, compartments, resource_display, resource_group))
+            
+        elif resource_type == 'block_volumes':
+            client = oci.core.BlockstorageClient(config)
+            volumes = oci.pagination.list_call_get_all_results(
+                client.list_volumes, compartment_id=compartment_id
+            ).data
+            for volume in volumes:
+                resources.append(extract_resource_details(volume, compartments, resource_display, resource_group))
+                
+        # NETWORK RESOURCES
+        elif resource_type == 'vcns':
+            client = oci.core.VirtualNetworkClient(config)
+            vcns = oci.pagination.list_call_get_all_results(
+                client.list_vcns, compartment_id=compartment_id
+            ).data
+            for vcn in vcns:
+                resources.append(extract_resource_details(vcn, compartments, resource_display, resource_group))
+                
+        elif resource_type == 'subnets':
+            client = oci.core.VirtualNetworkClient(config)
+            subnets = oci.pagination.list_call_get_all_results(
+                client.list_subnets, compartment_id=compartment_id
+            ).data
+            for subnet in subnets:
+                resource_details = extract_resource_details(subnet, compartments, resource_display, resource_group)
+                # Add VCN name if possible
+                if hasattr(subnet, 'vcn_id'):
+                    try:
+                        vcn = client.get_vcn(subnet.vcn_id).data
+                        resource_details['vcn_name'] = vcn.display_name if hasattr(vcn, 'display_name') else None
+                    except:
+                        pass
+                resources.append(resource_details)
+                
+        elif resource_type == 'security_lists':
+            client = oci.core.VirtualNetworkClient(config)
+            security_lists = oci.pagination.list_call_get_all_results(
+                client.list_security_lists, compartment_id=compartment_id
+            ).data
+            for sl in security_lists:
+                resource_details = extract_resource_details(sl, compartments, resource_display, resource_group)
+                resources.append(resource_details)
+                
+        elif resource_type == 'network_security_groups':
+            client = oci.core.VirtualNetworkClient(config)
+            nsgs = oci.pagination.list_call_get_all_results(
+                client.list_network_security_groups, compartment_id=compartment_id
+            ).data
+            for nsg in nsgs:
+                resources.append(extract_resource_details(nsg, compartments, resource_display, resource_group))
+                
+        elif resource_type == 'private_ips':
+            client = oci.core.VirtualNetworkClient(config)
+            
+            # Get all VCNs and their subnets
+            vcns = oci.pagination.list_call_get_all_results(
+                client.list_vcns, compartment_id=compartment_id
+            ).data
+            
+            for vcn in vcns:
+                subnets = oci.pagination.list_call_get_all_results(
+                    client.list_subnets, compartment_id=compartment_id, vcn_id=vcn.id
+                ).data
+                
+                for subnet in subnets:
+                    private_ips = oci.pagination.list_call_get_all_results(
+                        client.list_private_ips, subnet_id=subnet.id
+                    ).data
+                    
+                    for private_ip in private_ips:
+                        resource_details = extract_resource_details(private_ip, compartments, resource_display, resource_group)
+                        resource_details['vcn_id'] = vcn.id
+                        resource_details['subnet_id'] = subnet.id
+                        resources.append(resource_details)
+                        
+        elif resource_type == 'public_ips':
+            client = oci.core.VirtualNetworkClient(config)
+            
+            # Get public IPs in the region
+            public_ips = oci.pagination.list_call_get_all_results(
+                client.list_public_ips,
+                compartment_id=compartment_id,
+                scope="REGION"
+            ).data
+            
+            for public_ip in public_ips:
+                resources.append(extract_resource_details(public_ip, compartments, resource_display, resource_group))
+                
+            # Also get public IPs in the availability domain
+            identity_client = oci.identity.IdentityClient(config)
+            ads = oci.pagination.list_call_get_all_results(
+                identity_client.list_availability_domains, compartment_id=compartment_id
+            ).data
+            
+            for ad in ads:
+                ad_public_ips = oci.pagination.list_call_get_all_results(
+                    client.list_public_ips,
+                    compartment_id=compartment_id,
+                    scope="AVAILABILITY_DOMAIN", 
+                    availability_domain=ad.name
+                ).data
+                
+                for public_ip in ad_public_ips:
+                    resources.append(extract_resource_details(public_ip, compartments, resource_display, resource_group))
+                    
+        elif resource_type == 'nat_gateways':
+            client = oci.core.VirtualNetworkClient(config)
+            gateways = oci.pagination.list_call_get_all_results(
+                client.list_nat_gateways, compartment_id=compartment_id
+            ).data
+            
+            for gateway in gateways:
+                resources.append(extract_resource_details(gateway, compartments, resource_display, resource_group))
+                
+        elif resource_type == 'internet_gateways':
+            client = oci.core.VirtualNetworkClient(config)
+            
+            # Get all VCNs first
+            vcns = oci.pagination.list_call_get_all_results(
+                client.list_vcns, compartment_id=compartment_id
+            ).data
+            
+            for vcn in vcns:
+                gateways = oci.pagination.list_call_get_all_results(
+                    client.list_internet_gateways, compartment_id=compartment_id, vcn_id=vcn.id
+                ).data
+                
+                for gateway in gateways:
+                    resource_details = extract_resource_details(gateway, compartments, resource_display, resource_group)
+                    resource_details['vcn_id'] = vcn.id
+                    resources.append(resource_details)
+                    
+        elif resource_type == 'route_tables':
+            client = oci.core.VirtualNetworkClient(config)
+            
+            # Get all VCNs first
+            vcns = oci.pagination.list_call_get_all_results(
+                client.list_vcns, compartment_id=compartment_id
+            ).data
+            
+            for vcn in vcns:
+                route_tables = oci.pagination.list_call_get_all_results(
+                    client.list_route_tables, compartment_id=compartment_id, vcn_id=vcn.id
+                ).data
+                
+                for table in route_tables:
+                    resource_details = extract_resource_details(table, compartments, resource_display, resource_group)
+                    resource_details['vcn_id'] = vcn.id
+                    resources.append(resource_details)
+                    
+        elif resource_type == 'dhcp_options':
+            client = oci.core.VirtualNetworkClient(config)
+            
+            # Get all VCNs first
+            vcns = oci.pagination.list_call_get_all_results(
+                client.list_vcns, compartment_id=compartment_id
+            ).data
+            
+            for vcn in vcns:
+                dhcp_options = oci.pagination.list_call_get_all_results(
+                    client.list_dhcp_options, compartment_id=compartment_id, vcn_id=vcn.id
+                ).data
+                
+                for options in dhcp_options:
+                    resource_details = extract_resource_details(options, compartments, resource_display, resource_group)
+                    resource_details['vcn_id'] = vcn.id
+                    resources.append(resource_details)
+                    
+        elif resource_type == 'dns_resolvers':
+            try:
+                client = oci.dns.DnsClient(config)
+                
+                resolvers = oci.pagination.list_call_get_all_results(
+                    client.list_resolvers, compartment_id=compartment_id
+                ).data
+                
+                for resolver in resolvers:
+                    resources.append(extract_resource_details(resolver, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DNS client not available
+                pass
+                
+        elif resource_type == 'dns_views':
+            try:
+                client = oci.dns.DnsClient(config)
+                
+                views = oci.pagination.list_call_get_all_results(
+                    client.list_views, compartment_id=compartment_id
+                ).data
+                
+                for view in views:
+                    resources.append(extract_resource_details(view, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DNS client not available
+                pass
+                
+        elif resource_type == 'load_balancers':
+            try:
+                client = oci.load_balancer.LoadBalancerClient(config)
+                lbs = oci.pagination.list_call_get_all_results(
+                    client.list_load_balancers, compartment_id=compartment_id
+                ).data
+                for lb in lbs:
+                    resources.append(extract_resource_details(lb, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Load Balancer client not available
+                pass
+        
+        # DATABASE RESOURCES
+        elif resource_type == 'db_systems':
+            try:
+                client = oci.database.DatabaseClient(config)
+                db_systems = oci.pagination.list_call_get_all_results(
+                    client.list_db_systems, compartment_id=compartment_id
+                ).data
+                for db in db_systems:
+                    resources.append(extract_resource_details(db, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Database client not available
+                pass
+                
+        elif resource_type == 'autonomous_databases':
+            try:
+                client = oci.database.DatabaseClient(config)
+                adbs = oci.pagination.list_call_get_all_results(
+                    client.list_autonomous_databases, compartment_id=compartment_id
+                ).data
+                for adb in adbs:
+                    resources.append(extract_resource_details(adb, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Database client not available
+                pass
+                
+        elif resource_type == 'autonomous_db_backups':
+            try:
+                client = oci.database.DatabaseClient(config)
+                
+                # Get autonomous databases first
+                adbs = oci.pagination.list_call_get_all_results(
+                    client.list_autonomous_databases, compartment_id=compartment_id
+                ).data
+                
+                for adb in adbs:
+                    try:
+                        # Get backups for this ADB
+                        backups = oci.pagination.list_call_get_all_results(
+                            client.list_autonomous_database_backups, autonomous_database_id=adb.id
+                        ).data
+                        
+                        for backup in backups:
+                            resource_details = extract_resource_details(backup, compartments, resource_display, resource_group)
+                            resource_details['autonomous_database_id'] = adb.id
+                            resource_details['autonomous_database_name'] = adb.display_name
+                            resources.append(resource_details)
+                    except Exception:
+                        # Skip if can't get backups for this ADB
+                        pass
+            except Exception:
+                # Skip if Database client not available
+                pass
+                    
+        # STORAGE RESOURCES
+        elif resource_type == 'buckets':
+            try:
+                client = oci.object_storage.ObjectStorageClient(config)
+                namespace = client.get_namespace().data
+                buckets = oci.pagination.list_call_get_all_results(
+                    client.list_buckets, namespace_name=namespace, compartment_id=compartment_id
+                ).data
+                
+                for bucket in buckets:
+                    # Get detailed bucket info
+                    try:
+                        bucket_details = client.get_bucket(namespace_name=namespace, bucket_name=bucket.name).data
+                        resource_details = extract_resource_details(bucket_details, compartments, resource_display, resource_group)
+                        resources.append(resource_details)
+                    except:
+                        # Fall back to basic info
+                        resources.append(extract_resource_details(bucket, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Object Storage client not available
+                pass
+                
+        elif resource_type == 'file_systems':
+            try:
+                client = oci.file_storage.FileStorageClient(config)
+                # Need ADs for file systems
+                identity_client = oci.identity.IdentityClient(config)
+                ads = oci.pagination.list_call_get_all_results(
+                    identity_client.list_availability_domains, compartment_id=compartment_id
+                ).data
+                for ad in ads:
+                    file_systems = oci.pagination.list_call_get_all_results(
+                        client.list_file_systems, compartment_id=compartment_id, availability_domain=ad.name
+                    ).data
+                    for fs in file_systems:
+                        resources.append(extract_resource_details(fs, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if File Storage client not available
+                pass
+                
+        elif resource_type == 'sftp_servers':
+            # Try File Storage SFTP
+            try:
+                client = oci.file_storage.FileStorageClient(config)
+                
+                # See if it has transfer-related methods
+                if hasattr(client, 'list_transfer_servers'):
+                    servers = oci.pagination.list_call_get_all_results(
+                        client.list_transfer_servers, compartment_id=compartment_id
+                    ).data
+                    
+                    for server in servers:
+                        resources.append(extract_resource_details(server, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if client not available or method doesn't exist
+                pass
+                
+        # SECURITY RESOURCES
+        elif resource_type == 'vaults':
+            try:
+                client = oci.key_management.KmsVaultClient(config)
+                vaults = oci.pagination.list_call_get_all_results(
+                    client.list_vaults, compartment_id=compartment_id
+                ).data
+                
+                for vault in vaults:
+                    resources.append(extract_resource_details(vault, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if KMS client not available
+                pass
+                
+        elif resource_type == 'secrets':
+            try:
+                client = oci.vault.VaultsClient(config)
+                secrets = oci.pagination.list_call_get_all_results(
+                    client.list_secrets, compartment_id=compartment_id
+                ).data
+                
+                for secret in secrets:
+                    resource_details = extract_resource_details(secret, compartments, resource_display, resource_group)
+                    # For secrets, add vault name if possible
+                    if hasattr(secret, 'vault_id'):
+                        try:
+                            vault_client = oci.key_management.KmsVaultClient(config)
+                            vault = vault_client.get_vault(secret.vault_id).data
+                            resource_details['vault_name'] = vault.display_name if hasattr(vault, 'display_name') else None
+                        except:
+                            pass
+                    resources.append(resource_details)
+            except Exception:
+                # Skip if Vault client not available
+                pass
+                
+        elif resource_type == 'keys':
+            try:
+                # KMS client for key management
+                vault_client = oci.key_management.KmsVaultClient(config)
+                vaults = oci.pagination.list_call_get_all_results(
+                    vault_client.list_vaults, compartment_id=compartment_id
+                ).data
+                
+                for vault in vaults:
+                    # For each vault, we need to create a specific client with the vault's management endpoint
+                    try:
+                        # Get vault details to get management endpoint
+                        vault_details = vault_client.get_vault(vault.id).data
+                        
+                        # Only proceed if vault is active
+                        if vault_details.lifecycle_state != "ACTIVE":
+                            continue
+                            
+                        # Create a new config with the vault's management endpoint
+                        vault_config = config.copy()
+                        
+                        # Create a client with the vault endpoint
+                        kms_client = oci.key_management.KmsManagementClient(
+                            vault_config, 
+                            service_endpoint=vault_details.management_endpoint
+                        )
+                        
+                        # List keys in this vault
+                        vault_keys = oci.pagination.list_call_get_all_results(
+                            kms_client.list_keys, compartment_id=compartment_id
+                        ).data
+                        
+                        for key in vault_keys:
+                            resource_details = extract_resource_details(key, compartments, resource_display, resource_group)
+                            # Add vault information
+                            resource_details['vault_id'] = vault.id
+                            resource_details['vault_name'] = vault.display_name
+                            resources.append(resource_details)
+                    except Exception:
+                        # Skip if can't access vault
+                        pass
+            except Exception:
+                # Skip if KMS client not available
+                pass
+                
+        elif resource_type == 'policies':
+            try:
+                client = oci.identity.IdentityClient(config)
+                policies = oci.pagination.list_call_get_all_results(
+                    client.list_policies, compartment_id=compartment_id
+                ).data
+                
+                for policy in policies:
+                    resources.append(extract_resource_details(policy, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Identity client not available
+                pass
+                
+        # MANAGEMENT RESOURCES
+        elif resource_type == 'logs':
+            try:
+                client = oci.logging.LoggingManagementClient(config)
+                
+                # Get log groups first
+                log_groups = oci.pagination.list_call_get_all_results(
+                    client.list_log_groups, compartment_id=compartment_id
+                ).data
+                
+                for group in log_groups:
+                    # Get logs in each group
+                    logs = oci.pagination.list_call_get_all_results(
+                        client.list_logs, log_group_id=group.id
+                    ).data
+                    
+                    for log in logs:
+                        resource_details = extract_resource_details(log, compartments, resource_display, resource_group)
+                        resource_details['log_group_id'] = group.id
+                        resources.append(resource_details)
+            except Exception:
+                # Skip if Logging client not available
+                pass
+                
+        elif resource_type == 'log_groups':
+            try:
+                client = oci.logging.LoggingManagementClient(config)
+                log_groups = oci.pagination.list_call_get_all_results(
+                    client.list_log_groups, compartment_id=compartment_id
+                ).data
+                
+                for group in log_groups:
+                    resources.append(extract_resource_details(group, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Logging client not available
+                pass
+                
+        elif resource_type == 'ons_subscriptions':
+            try:
+                client = oci.ons.NotificationDataPlaneClient(config)
+                subscriptions = oci.pagination.list_call_get_all_results(
+                    client.list_subscriptions, compartment_id=compartment_id
+                ).data
+                
+                for subscription in subscriptions:
+                    resources.append(extract_resource_details(subscription, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Notification client not available
+                pass
+                
+        elif resource_type == 'ons_topics':
+            try:
+                client = oci.ons.NotificationControlPlaneClient(config)
+                topics = oci.pagination.list_call_get_all_results(
+                    client.list_topics, compartment_id=compartment_id
+                ).data
+                
+                for topic in topics:
+                    resources.append(extract_resource_details(topic, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Notification client not available
+                pass
+                
+        # INTEGRATION RESOURCES
+        elif resource_type == 'integration_instances':
+            try:
+                client = oci.integration.IntegrationInstanceClient(config)
+                instances = oci.pagination.list_call_get_all_results(
+                    client.list_integration_instances, compartment_id=compartment_id
+                ).data
+                
+                for instance in instances:
+                    resources.append(extract_resource_details(instance, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Integration client not available
+                pass
+                
+        elif resource_type == 'api_gateways':
+            try:
+                # Try different API method names until we find the right one
+                client = oci.apigateway.ApiGatewayClient(config)
+                try:
+                    # Try the most likely method names
+                    gateways = oci.pagination.list_call_get_all_results(
+                        client.list_gateways, compartment_id=compartment_id
+                    ).data
+                except AttributeError:
+                    try:
+                        # Maybe it's this one
+                        gateways = oci.pagination.list_call_get_all_results(
+                            client.list_api_gateways, compartment_id=compartment_id
+                        ).data
+                    except AttributeError:
+                        # Try one more
+                        gateways = oci.pagination.list_call_get_all_results(
+                            client.list_apis, compartment_id=compartment_id
+                        ).data
+                
+                for gateway in gateways:
+                    resources.append(extract_resource_details(gateway, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if API Gateway client not available
+                pass
+                
+        # DEVOPS RESOURCES
+        elif resource_type == 'build_pipelines':
+            try:
+                client = oci.devops.DevopsClient(config)
+                pipelines = oci.pagination.list_call_get_all_results(
+                    client.list_build_pipelines, compartment_id=compartment_id
+                ).data
+                
+                for pipeline in pipelines:
+                    resources.append(extract_resource_details(pipeline, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DevOps client not available
+                pass
 
-def get_compartment_full_path(compartment_name, compartment_id, compartment_hierarchy):
-    """Get the full path of a compartment if available in hierarchy."""
-    if compartment_id in compartment_hierarchy:
-        return compartment_hierarchy[compartment_id]
-    return compartment_name
+        elif resource_type == 'build_runs':
+            try:
+                client = oci.devops.DevopsClient(config)
+                runs = oci.pagination.list_call_get_all_results(
+                    client.list_build_runs, compartment_id=compartment_id
+                ).data
+                
+                for run in runs:
+                    resources.append(extract_resource_details(run, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DevOps client not available
+                pass
+
+        elif resource_type == 'repositories':
+            try:
+                client = oci.devops.DevopsClient(config)
+                repos = oci.pagination.list_call_get_all_results(
+                    client.list_repositories, compartment_id=compartment_id
+                ).data
+                
+                for repo in repos:
+                    resources.append(extract_resource_details(repo, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DevOps client not available
+                pass
+
+        elif resource_type == 'triggers':
+            try:
+                client = oci.devops.DevopsClient(config)
+                triggers = oci.pagination.list_call_get_all_results(
+                    client.list_triggers, compartment_id=compartment_id
+                ).data
+                
+                for trigger in triggers:
+                    resources.append(extract_resource_details(trigger, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if DevOps client not available
+                pass
+
+        elif resource_type == 'artifacts':
+            try:
+                client = oci.artifacts.ArtifactsClient(config)
+                artifacts = oci.pagination.list_call_get_all_results(
+                    client.list_generic_artifacts, compartment_id=compartment_id
+                ).data
+                
+                for artifact in artifacts:
+                    resources.append(extract_resource_details(artifact, compartments, resource_display, resource_group))
+            except Exception:
+                # Skip if Artifacts client not available
+                pass
+                
+        print(f"Found {len(resources)} resources")
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        
+    return (resource_type, resource_display, resources)
+
+def scan_resources(config, compartment_id, resource_type_filter=None, resource_group_filter=None, max_workers=10):
+    """Scan resources in the compartment and return details."""
+    print(f"Scanning resources in compartment {compartment_id}...")
+    
+    # Get all compartments for cross-reference lookup
+    identity_client = oci.identity.IdentityClient(config)
+    compartments = get_all_compartments(identity_client, config["tenancy"])
+    compartment_map = {c.id: c for c in compartments}
+    print(f"Found {len(compartment_map)} compartments in the tenancy")
+    
+    # Filter resource types by group if requested
+    if resource_group_filter:
+        resource_types_to_scan = [(rt, rd, rg) for rt, rd, rg in RESOURCE_TYPES if rg == resource_group_filter]
+        if not resource_types_to_scan:
+            print(f"No resources found for group: {resource_group_filter}")
+            resource_types_to_scan = RESOURCE_TYPES
+        else:
+            print(f"Filtering to scan {resource_group_filter} resources ({len(resource_types_to_scan)} resource types)")
+    else:
+        resource_types_to_scan = RESOURCE_TYPES
+    
+    # Further filter by specific resource type if requested
+    if resource_type_filter:
+        resource_types_to_scan = [(rt, rd, rg) for rt, rd, rg in resource_types_to_scan if rt == resource_type_filter]
+        if not resource_types_to_scan:
+            print(f"Resource type '{resource_type_filter}' not found.")
+            print("Available resource types:")
+            for rt, rd, _ in RESOURCE_TYPES:
+                print(f"  - {rt}: {rd}")
+            resource_types_to_scan = RESOURCE_TYPES
+        else:
+            print(f"Filtering to scan only: {resource_types_to_scan[0][1]}")
+    
+    # Scan resources in parallel
+    results = {}
+    start_time = time.time()
+    
+    print("\nBeginning resource scan...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(get_resource_details, config, compartment_id, resource_spec, compartment_map): resource_spec
+            for resource_spec in resource_types_to_scan
+        }
+        
+        for future in futures:
+            try:
+                resource_type, resource_display, resources = future.result()
+                results[resource_type] = {
+                    'display_name': resource_display,
+                    'resources': resources,
+                    'count': len(resources)
+                }
+            except Exception as e:
+                print(f"Error in resource scan: {e}")
+    
+    end_time = time.time()
+    elapsed = end_time - start_time
+    
+    print(f"\nCompleted scan in {elapsed:.2f} seconds")
+    
+    return results, compartment_map
+
+def find_cross_compartment_references(resources_by_type, compartment_map):
+    """Find cross-compartment references."""
+    print("Analyzing cross-compartment references...")
+    
+    # Create a more comprehensive map of resource IDs to resource details
+    resource_id_map = {}
+    
+    # First pass - collect all resource IDs
+    for resource_type, info in resources_by_type.items():
+        for resource in info['resources']:
+            # Add primary resource ID
+            if 'resource_id' in resource and resource['resource_id'] != 'N/A':
+                resource_id_map[resource['resource_id']] = {
+                    'type': resource_type,
+                    'details': resource
+                }
+    
+    # Track cross-compartment references
+    cross_compartment_refs = 0
+    
+    # Second pass - find cross-compartment references
+    for resource_type, info in resources_by_type.items():
+        for resource in info['resources']:
+            if 'compartment_id' not in resource:
+                continue
+                
+            resource_compartment_id = resource['compartment_id']
+            
+            # Check all resource attributes for potential cross-compartment references
+            for attr, value in resource.items():
+                if (attr.endswith('_id') and isinstance(value, str) and 
+                    value.startswith('ocid1.') and value in resource_id_map):
+                    
+                    # Found a reference to another resource
+                    referenced_resource = resource_id_map[value]
+                    referenced_details = referenced_resource['details']
+                    
+                    # Only proceed if we have compartment ID for both resources
+                    if 'compartment_id' not in referenced_details:
+                        continue
+                        
+                    referenced_compartment_id = referenced_details['compartment_id']
+                    
+                    # Is this a cross-compartment reference?
+                    if (referenced_compartment_id != resource_compartment_id and 
+                        attr in REFERENCE_ATTRIBUTES):
+                        cross_compartment_refs += 1
+                        
+                        # Add cross-compartment reference info
+                        if 'cross_compartment_references' not in resource or resource['cross_compartment_references'] == 'None':
+                            resource['cross_compartment_references'] = ''
+                            
+                        # Add reference details with compartment name
+                        ref_compartment_name = get_compartment_path(referenced_compartment_id, compartment_map) if referenced_compartment_id in compartment_map else 'Unknown'
+                        
+                        # Add the resource name if available
+                        ref_resource_name = referenced_details.get('resource_name', 'Unnamed')
+                        resource['cross_compartment_references'] += f"{attr}: {ref_resource_name} [{value}] (in {ref_compartment_name}); "
+    
+    # Clean up cross-compartment references formatting
+    for resource_type, info in resources_by_type.items():
+        for resource in info['resources']:
+            if 'cross_compartment_references' in resource and resource['cross_compartment_references'].endswith('; '):
+                resource['cross_compartment_references'] = resource['cross_compartment_references'][:-2]
+                
+            if 'cross_compartment_references' not in resource or not resource['cross_compartment_references']:
+                resource['cross_compartment_references'] = 'None'
+    
+    print(f"Found {cross_compartment_refs} cross-compartment references")
+    
+    return resources_by_type
+
+def flatten_resources(resources_by_type, compartment_info, compartment_map):
+    """Flatten resources into a list for CSV output."""
+    flattened = []
+    
+    for resource_type, info in resources_by_type.items():
+        for resource in info['resources']:
+            # Add full compartment path if it has a compartment_id
+            if 'compartment_id' in resource and resource['compartment_id'] in compartment_map:
+                resource['compartment_name'] = get_compartment_path(resource['compartment_id'], compartment_map)
+            elif 'compartment_name' not in resource:
+                resource['compartment_name'] = compartment_info.get('name', 'Unknown')
+            
+            # Ensure lifecycle state is properly captured
+            if 'lifecycle_state' in resource and (resource['lifecycle_state'] == 'N/A' or not resource['lifecycle_state']):
+                # Check for status field as an alternative
+                if 'status' in resource and resource['status'] != 'N/A':
+                    resource['lifecycle_state'] = resource['status']
+                # For bucket objects
+                elif resource_type == 'buckets' and not resource['lifecycle_state']:
+                    resource['lifecycle_state'] = 'ACTIVE'  # Default for buckets
+                # For IP addresses
+                elif resource_type in ['private_ips', 'public_ips'] and not resource['lifecycle_state']:
+                    if 'is_reserved' in resource and resource['is_reserved']:
+                        resource['lifecycle_state'] = 'RESERVED'
+                    elif 'assigned' in resource and resource['assigned']:
+                        resource['lifecycle_state'] = 'ASSIGNED'
+                    else:
+                        resource['lifecycle_state'] = 'AVAILABLE'
+            
+            # Rename fields to match our desired CSV schema
+            field_mapping = {
+                'resource_id': 'Resource ID',
+                'resource_name': 'Resource Name',
+                'resource_type': 'Resource Type',
+                'service': 'Service',
+                'compartment_id': 'Compartment ID',
+                'compartment_name': 'Compartment Name',
+                'region': 'Region',
+                'availability_domain': 'Availability Domain',
+                'lifecycle_state': 'Lifecycle State',
+                'time_created': 'Time Created',
+                'defined_tags': 'Defined Tags',
+                'freeform_tags': 'Freeform Tags',
+                'cross_compartment_references': 'Cross-Compartment References',
+                'shape': 'Shape',
+                'ocpu_count': 'OCPU Count',
+                'memory': 'Memory',
+                'storage_size': 'Storage Size',
+                'cidr_block': 'CIDR Block',
+                'public_access': 'Public Access'
+            }
+            
+            # Create a new resource with the remapped fields
+            mapped_resource = {}
+            for old_key, new_key in field_mapping.items():
+                if old_key in resource:
+                    mapped_resource[new_key] = resource[old_key]
+                else:
+                    mapped_resource[new_key] = 'N/A'
+            
+            # Add any remaining fields that aren't in our mapping
+            for key, value in resource.items():
+                if key not in field_mapping.keys() and key not in ['id', 'display_name', 'name', 'resource_group']:
+                    mapped_resource[key] = value
+            
+            flattened.append(mapped_resource)
+    
+    return flattened
 
 def main():
     """Main function."""
     args = parse_arguments()
     start_time = time.time()
     
-    print(f"OCI Tenancy Explorer")
-    print(f"==================")
+    # Set default output file if not specified
+    if not args.output_file:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.output_file = f"{args.compartment_name}_resources_{timestamp}.csv"
     
-    # Get all profiles from config file
+    print(f"OCI Tenancy Explorer (Direct API)")
+    print(f"=============================")
+    
+    # Load OCI configuration
     config_file = os.path.expanduser(args.config_file)
-    profiles = get_config_profiles(config_file)
-    print(f"Found profiles: {', '.join(profiles)}")
+    try:
+        config = oci.config.from_file(config_file, args.profile)
+        print(f"Loaded OCI configuration from {config_file}, profile: {args.profile}")
+    except Exception as e:
+        print(f"Error loading OCI configuration: {e}")
+        print("Make sure you have set up the OCI CLI configuration file at ~/.oci/config")
+        sys.exit(1)
     
-    # Check if profiles exist
-    if not profiles:
-        print("No profiles found in the config file. Using DEFAULT config.")
-        config = oci.config.from_file(config_file)
-    else:
-        print(f"Using profile: {profiles[0]}")
-        config = oci.config.from_file(config_file, profiles[0])
-    
-    all_resources = []
-    compartment_hierarchy = {}
-    all_compartments = []
-    skip_regions = [r.strip() for r in args.skip_regions.split(',') if r.strip()]
-    
-    # First, get the identity client to discover compartments and regions
-    print("\nInitializing OCI identity client...")
+    # Initialize identity client for compartment operations
     identity_client = oci.identity.IdentityClient(config)
     
-    tenancy_id = config.get('tenancy')
-    if not tenancy_id:
-        print("Error: No tenancy ID found in the config file.")
+    # Get tenancy ID from config
+    tenancy_id = config["tenancy"]
+    print(f"Tenancy ID: {tenancy_id}")
+    
+    # Get compartment ID by name
+    try:
+        compartment_id = get_compartment_id_by_name(identity_client, tenancy_id, args.compartment_name)
+        print(f"Found compartment ID: {compartment_id}")
+        # Get the compartment details
+        compartment = identity_client.get_compartment(compartment_id).data
+        compartment_info = {
+            'id': compartment.id,
+            'name': compartment.name,
+            'description': compartment.description if hasattr(compartment, 'description') else 'N/A',
+            'lifecycle_state': compartment.lifecycle_state
+        }
+    except Exception as e:
+        print(f"Error: {e}")
         sys.exit(1)
-        
-    print(f"Looking for compartment: {args.compartment_name}")
-    compartment = get_compartment_by_name(identity_client, tenancy_id, args.compartment_name)
-    print(f"Found compartment: {compartment.name}")
     
-    # Get all regions
-    print("Getting all available regions...")
-    all_regions = get_all_regions(identity_client)
-    if not all_regions:
-        print("Warning: No regions found. Using region from config file.")
-        region = config.get('region')
-        if region:
-            all_regions = [region]
-        else:
-            print("Error: No region specified in config file.")
-            sys.exit(1)
-            
-    if skip_regions:
-        print(f"Skipping regions: {', '.join(skip_regions)}")
-        all_regions = [r for r in all_regions if r not in skip_regions]
-    print(f"Will scan the following regions: {', '.join(all_regions)}")
+    # Get all compartments for hierarchy
+    print("Getting compartment hierarchy...")
+    all_compartments = get_all_compartments(identity_client, tenancy_id)
+    compartment_map = {c.id: c for c in all_compartments}
     
-    # Get compartments
+    # Determine compartments to scan
     compartments_to_scan = []
     if args.recursive:
-        print("Scanning for child compartments...")
-        all_compartments = get_all_compartments(identity_client, tenancy_id)
-        compartment_hierarchy = build_compartment_hierarchy(identity_client, tenancy_id, all_compartments)
-        compartments_to_scan = [c for c in all_compartments 
-                             if c.id == compartment.id or 
-                                (hasattr(c, 'compartment_id') and 
-                                (c.compartment_id == compartment.id or
-                                (c.id != compartment.id and c.lifecycle_state == "ACTIVE")))]
-        print(f"Found {len(compartments_to_scan)} compartments to scan:")
-        for c in compartments_to_scan:
-            print(f"  - {compartment_hierarchy.get(c.id, c.name)}")
-    else:
-        compartments_to_scan = [compartment]
-        print(f"Scanning single compartment: {compartment.name}")
-    
-    # Scan all regions
-    for region in all_regions:
-        print(f"\nSwitching to region: {region}")
+        # Add parent compartment
+        compartments_to_scan.append(compartment_id)
         
-        try:
-            # Create new config for this region
-            region_config = dict(config)
-            region_config['region'] = region
-            
-            print(f"Initializing OCI clients for region: {region}...")
-            clients = get_service_clients(region_config)
-            
-            for comp in compartments_to_scan:
-                comp_full_path = get_compartment_full_path(comp.name, comp.id, compartment_hierarchy)
-                print(f"\nExploring compartment: {comp_full_path} in region {region}...")
-                resources = explore_tenancy(comp.id, comp_full_path, clients, region, args.max_workers)
-                all_resources.extend(resources)
-                
-        except Exception as e:
-            print(f"Error processing region {region}: {e}")
-            continue
+        # Add child compartments
+        child_compartments = [c.id for c in all_compartments 
+                             if hasattr(c, 'compartment_id') and c.compartment_id == compartment_id]
+        compartments_to_scan.extend(child_compartments)
+        
+        print(f"Recursively scanning {args.compartment_name} and {len(child_compartments)} child compartments")
+    else:
+        # Just scan the specified compartment
+        compartments_to_scan.append(compartment_id)
+        print(f"Scanning single compartment: {args.compartment_name}")
     
-    print(f"\nResource exploration complete. Found {len(all_resources)} resources across all regions and services.")
-    write_csv(all_resources, args.output_file)
+    # Scan each compartment
+    all_resources_by_type = {}
+    
+    for comp_id in compartments_to_scan:
+        comp_name = compartment_map[comp_id].name if comp_id in compartment_map else "Unknown"
+        print(f"\nScanning compartment: {comp_name} ({comp_id})")
+        
+        # Scan resources
+        resources_by_type, _ = scan_resources(
+            config, 
+            comp_id, 
+            args.resource_type,
+            args.resource_group,
+            args.max_workers
+        )
+        
+        # Merge with existing resources
+        for resource_type, info in resources_by_type.items():
+            if resource_type in all_resources_by_type:
+                all_resources_by_type[resource_type]['resources'].extend(info['resources'])
+                all_resources_by_type[resource_type]['count'] += info['count']
+            else:
+                all_resources_by_type[resource_type] = info
+    
+    # Find cross-compartment references
+    all_resources_by_type = find_cross_compartment_references(all_resources_by_type, compartment_map)
+    
+    # Flatten resources for CSV output
+    flattened_resources = flatten_resources(all_resources_by_type, compartment_info, compartment_map)
+    
+    # Define CSV headers with the correct order
+    base_headers = [
+        'Compartment Name',
+        'Resource Name',
+        'Resource Type',
+        'Service',
+        'Region',
+        'Availability Domain',
+        'Shape',
+        'OCPU Count',
+        'Memory',
+        'Storage Size',
+        'CIDR Block',
+        'Public Access',
+        'Lifecycle State',
+        'Time Created',
+        'Cross-Compartment References',
+        'Resource ID',
+        'Compartment ID',
+        'Defined Tags',
+        'Freeform Tags'
+    ]
+    
+    # Get all field names from all resources, excluding ones we don't want
+    all_fields = set(base_headers)
+    excluded_fields = {'id', 'display_name', 'name', 'resource_group'}
+    for resource in flattened_resources:
+        all_fields.update([k for k in resource.keys() if k not in excluded_fields])
+    
+    # Final headers: base headers first, then any additional fields sorted alphabetically
+    headers = base_headers + sorted(list(all_fields - set(base_headers)))
+    
+    # Write CSV
+    print(f"\nWriting {len(flattened_resources)} resources to {args.output_file}")
+    with open(args.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(flattened_resources)
+    
+    # Print summary
+    total_resources = sum(info['count'] for info in all_resources_by_type.values())
+    
+    print("\nResource counts by type:")
+    for resource_type, info in sorted(all_resources_by_type.items(), key=lambda x: x[1]['display_name']):
+        if info['count'] > 0:
+            print(f"  - {info['display_name']}: {info['count']}")
+    
+    print(f"\nTotal resources: {total_resources}")
+    print(f"Results written to: {args.output_file}")
     
     elapsed_time = time.time() - start_time
     print(f"Total execution time: {elapsed_time:.2f} seconds")
