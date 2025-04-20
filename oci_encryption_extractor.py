@@ -21,8 +21,28 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
+# Define all required OCI services
+from oci.key_management import KmsVaultClient, KmsManagementClient
+from oci.identity import IdentityClient
+from oci.resource_search import ResourceSearchClient
+from oci.secrets import SecretsClient, SecretsClientCompositeOperations
+from oci.vault import VaultsClient, VaultsClientCompositeOperations
+
 # Default regions to scan
 DEFAULT_REGIONS = ['us-ashburn-1', 'us-phoenix-1']
+
+# Configure logging
+import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Add global resource counter for statistics
+resource_stats = {
+    'encryption_keys': 0,
+    'vault_secrets': 0,
+    'resources_using_keys': 0,
+    'resources_using_secrets': 0
+}
 
 def safe_parse_datetime(date_string):
     """Safely parse datetime string with enhanced error handling"""
@@ -198,6 +218,10 @@ def get_vault_secrets(config, compartment_id, vault_id, vault_name="Unknown vaul
     try:
         # Create a client for secrets
         secrets_client = oci.secrets.SecretsClient(config)
+        vaults_client = oci.vault.VaultsClient(config)
+        
+        # For better debugging
+        logger.info(f"Searching for secrets in vault: {vault_name} (ID: {vault_id})")
         
         # List all secrets in the compartment that belong to this vault
         secrets_response = oci.pagination.list_call_get_all_results(
@@ -205,10 +229,32 @@ def get_vault_secrets(config, compartment_id, vault_id, vault_name="Unknown vaul
             compartment_id,
             vault_id=vault_id
         )
-        return secrets_response.data
+        
+        # Also try using the Vaults client for better coverage
+        try:
+            vault_secrets_response = oci.pagination.list_call_get_all_results(
+                vaults_client.list_secrets,
+                compartment_id,
+                vault_id=vault_id
+            )
+            combined_secrets = list(secrets_response.data)
+            
+            # Check if we got any additional secrets from the vaults client
+            for secret in vault_secrets_response.data:
+                if secret.id not in [s.id for s in combined_secrets]:
+                    combined_secrets.append(secret)
+            
+            logger.info(f"Found {len(combined_secrets)} secrets in vault {vault_name} using combined methods")
+            return combined_secrets
+        except Exception as e:
+            # If vaults client method fails, return the secrets from the first method
+            logger.warning(f"Error using VaultsClient to get secrets, fallback to SecretsClient only: {e}")
+            logger.info(f"Found {len(secrets_response.data)} secrets in vault {vault_name} using SecretsClient only")
+            return secrets_response.data
+            
     except Exception as e:
-        # Simplified error message
-        print(f"Error retrieving secrets in vault {vault_name}: {str(e)}")
+        # Improved error message with more details
+        logger.error(f"Error retrieving secrets in vault {vault_name} (ID: {vault_id}): {str(e)}")
         return []
 
 def get_secret_details(config, secret_id, secret_name="Unknown secret"):
@@ -219,10 +265,24 @@ def get_secret_details(config, secret_id, secret_name="Unknown secret"):
         
         # Get secret details
         secret_response = secrets_client.get_secret(secret_id)
-        return secret_response.data
+        
+        # Try to get secret bundle as well (may have additional information)
+        try:
+            # Try to get the content of the secret if allowed
+            secret_bundle = secrets_client.get_secret_bundle(secret_id)
+            logger.info(f"Successfully retrieved secret bundle for {secret_name}")
+            
+            # Combine the information (but don't include the actual secret value)
+            secret_data = secret_response.data
+            # We could potentially add more metadata from the bundle here
+            return secret_data
+        except Exception as e:
+            # If we can't get the bundle, just return the basic details
+            logger.warning(f"Could not retrieve secret bundle for {secret_name}: {e}")
+            return secret_response.data
     except Exception as e:
-        # Simplified error message
-        print(f"Error retrieving details for secret {secret_name}: {str(e)}")
+        # Improved error message
+        logger.error(f"Error retrieving details for secret {secret_name} (ID: {secret_id}): {str(e)}")
         return None
 
 def determine_key_type(key_details):
@@ -254,17 +314,24 @@ def determine_key_type(key_details):
 
 def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
     """Find resources that use a specific key"""
+    global resource_stats
     try:
-        # Enhanced search query to find more resources using encryption
+        logger.info(f"Searching for resources using key: {key_name} (ID: {key_id})")
+        
+        # Comprehensive search query to find encrypted resources and their associations
         search_text = f"""
             query all resources
             where (
                 definedTags.contains('*.\"EncryptionKey\".*') ||
-                freeformTags.contains('*EncryptionKey*') ||
-                freeformTags.contains('*encryption*') ||
+                definedTags.contains('*.kmsKeyId.*') ||
                 definedTags.contains('*.\"KmsKeyId\".*') ||
                 definedTags.contains('*.\"key_id\".*') ||
                 definedTags.contains('*.\"master_key_id\".*') ||
+                definedTags.contains('*.\"MasterEncryptionKey\".*') ||
+                freeformTags.contains('*EncryptionKey*') ||
+                freeformTags.contains('*encryption*') ||
+                freeformTags.contains('*key_id*') ||
+                freeformTags.contains('*kms*') ||
                 (resourceType = 'VolumeBackup' && isEncrypted = 'true') ||
                 (resourceType = 'BootVolume' && isEncrypted = 'true') ||
                 (resourceType = 'Volume' && isEncrypted = 'true') ||
@@ -278,42 +345,74 @@ def find_resources_using_key(search_client, key_id, key_name="Unknown key"):
                 (resourceType = 'BackupDestination' && isEncrypted = 'true') ||
                 (resourceType = 'DbSystem' && isEncrypted = 'true') ||
                 (resourceType = 'VmCluster' && isEncrypted = 'true') ||
-                (resourceType = 'Vault')
+                (resourceType = 'Vault') ||
+                (resourceType = 'ObjectStorageObject' && isEncrypted = 'true') ||
+                (resourceType = 'AutonomousContainerDatabase' && isEncrypted = 'true') ||
+                (resourceType = 'BackupDestination' && isEncrypted = 'true') ||
+                (resourceType = 'BootVolumeBackup' && isEncrypted = 'true')
             )
         """
         
         search_response = search_client.search_resources(
             oci.resource_search.models.StructuredSearchDetails(
-                query=search_text
+                query=search_text,
+                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
+                # Increase limit to find more resources
+                limit=1000
             )
         )
         
         # Filter results to find resources that reference this key
         resources = []
+        
+        # More comprehensive matching algorithm
         for item in search_response.data.items:
-            resource_json = json.dumps(oci.util.to_dict(item))
+            resource_dict = oci.util.to_dict(item)
+            resource_json = json.dumps(resource_dict, default=str)
+            
+            # Check for the key_id in the resource JSON
             if key_id in resource_json:
                 resources.append(item)
+                continue
+                
+            # Check for key_id in defined tags (more thorough check)
+            if "defined_tags" in resource_dict:
+                for namespace, tags in resource_dict.get("defined_tags", {}).items():
+                    for tag_key, tag_value in tags.items():
+                        if isinstance(tag_value, str) and key_id in tag_value:
+                            resources.append(item)
+                            break
         
-        if not resources:
-            print(f"No resources using key '{key_name}'")
+        resource_count = len(resources)
+        if resource_count > 0:
+            logger.info(f"Found {resource_count} resources using key '{key_name}'")
+            resource_stats['resources_using_keys'] += resource_count
+        else:
+            logger.info(f"No resources found using key '{key_name}'")
         
         return resources
     except Exception as e:
-        print(f"Error accessing resources for key '{key_name}': {str(e)}")
+        logger.error(f"Error searching for resources using key '{key_name}': {str(e)}")
         return []
 
 def find_resources_using_secret(search_client, secret_id, secret_name="Unknown secret"):
     """Find resources that use a specific secret"""
+    global resource_stats
     try:
-        # Search query focused on finding resources that might reference this secret
+        logger.info(f"Searching for resources using secret: {secret_name} (ID: {secret_id})")
+        
+        # Comprehensive search query for resources using secrets
         search_text = f"""
             query all resources
             where (
                 definedTags.contains('*.\"SecretId\".*') ||
+                definedTags.contains('*.\"secretId\".*') ||
+                definedTags.contains('*.\"secret_id\".*') ||
+                definedTags.contains('*.\"secretOcid\".*') ||
                 freeformTags.contains('*secret*') ||
                 freeformTags.contains('*Secret*') ||
-                definedTags.contains('*.\"secret_id\".*') ||
+                freeformTags.contains('*secretId*') ||
+                freeformTags.contains('*SecretId*') ||
                 (resourceType = 'ApiGateway') ||
                 (resourceType = 'Function') ||
                 (resourceType = 'FunctionsApplication') ||
@@ -323,37 +422,65 @@ def find_resources_using_secret(search_client, secret_id, secret_name="Unknown s
                 (resourceType = 'DbSystem') ||
                 (resourceType = 'Cluster') ||
                 (resourceType = 'VmCluster') ||
-                (resourceType = 'StreamPool')
+                (resourceType = 'StreamPool') ||
+                (resourceType = 'ContainerInstance') ||
+                (resourceType = 'OkeCluster') ||
+                (resourceType = 'DevOpsProject') ||
+                (resourceType = 'IdentityProvider')
             )
         """
         
         search_response = search_client.search_resources(
             oci.resource_search.models.StructuredSearchDetails(
-                query=search_text
+                query=search_text,
+                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
+                # Increase limit to find more resources
+                limit=1000
             )
         )
         
         # Filter results to find resources that reference this secret
         resources = []
+        
+        # More comprehensive matching algorithm
         for item in search_response.data.items:
-            resource_json = json.dumps(oci.util.to_dict(item))
+            resource_dict = oci.util.to_dict(item)
+            resource_json = json.dumps(resource_dict, default=str)
+            
+            # Check for the secret_id in the resource JSON
             if secret_id in resource_json:
                 resources.append(item)
+                continue
+                
+            # Check for secret_id in defined tags (more thorough check)
+            if "defined_tags" in resource_dict:
+                for namespace, tags in resource_dict.get("defined_tags", {}).items():
+                    for tag_key, tag_value in tags.items():
+                        if isinstance(tag_value, str) and secret_id in tag_value:
+                            resources.append(item)
+                            break
         
-        if not resources:
-            print(f"No resources using secret '{secret_name}'")
+        resource_count = len(resources)
+        if resource_count > 0:
+            logger.info(f"Found {resource_count} resources using secret '{secret_name}'")
+            resource_stats['resources_using_secrets'] += resource_count
+        else:
+            logger.info(f"No resources found using secret '{secret_name}'")
         
         return resources
     except Exception as e:
-        print(f"Error accessing resources for secret '{secret_name}': {str(e)}")
+        logger.error(f"Error searching for resources using secret '{secret_name}': {str(e)}")
         return []
 
 def process_key(region, key_data, compartment_data, vault_data, config, search_client):
     """Process a single key and collect all its details"""
+    global resource_stats
     try:
         key_id = key_data.id
         key_name = key_data.display_name
         management_endpoint = vault_data.management_endpoint
+        
+        logger.info(f"Processing encryption key: {key_name} (ID: {key_id})")
         
         # Get key details
         key_details = get_key_details(
@@ -364,7 +491,7 @@ def process_key(region, key_data, compartment_data, vault_data, config, search_c
         )
         
         if not key_details:
-            print(f"No details available for key {key_name}. Skipping.")
+            logger.warning(f"No details available for key {key_name}. Skipping.")
             return None
         
         # Get key versions
@@ -382,7 +509,11 @@ def process_key(region, key_data, compartment_data, vault_data, config, search_c
             key_name
         )
         
-        print(f"Key {key_name}: Found {len(resources_using_key)} resources using this key")
+        # Increment key counter
+        resource_stats['encryption_keys'] += 1
+        
+        # Convert key details to dict for storage
+        key_details_dict = oci.util.to_dict(key_details)
         
         # Create key entry
         key_entry = {
@@ -393,23 +524,27 @@ def process_key(region, key_data, compartment_data, vault_data, config, search_c
             "vault_name": vault_data.display_name,
             "vault_management_endpoint": vault_data.management_endpoint,
             "vault_crypto_endpoint": vault_data.crypto_endpoint,
-            "key_details": oci.util.to_dict(key_details),
+            "key_details": key_details_dict,
             "key_versions": [oci.util.to_dict(version) for version in key_versions],
             "resources_using_key": [oci.util.to_dict(resource) for resource in resources_using_key],
-            "encryption_type": determine_key_type(oci.util.to_dict(key_details)),
+            "encryption_type": determine_key_type(key_details_dict),
             "entity_type": "Encryption Key"
         }
         
+        logger.info(f"Completed processing key: {key_name}")
         return key_entry
     except Exception as e:
-        print(f"Error processing key {key_data.display_name if hasattr(key_data, 'display_name') else key_id}: {e}")
+        logger.error(f"Error processing key {key_data.display_name if hasattr(key_data, 'display_name') else 'Unknown'}: {e}")
         return None
 
 def process_secret(region, secret_data, compartment_data, vault_data, config, search_client):
     """Process a single secret and collect all its details"""
+    global resource_stats
     try:
         secret_id = secret_data.id
         secret_name = secret_data.display_name
+        
+        logger.info(f"Processing secret: {secret_name} (ID: {secret_id})")
         
         # Get secret details
         secret_details = get_secret_details(
@@ -419,7 +554,7 @@ def process_secret(region, secret_data, compartment_data, vault_data, config, se
         )
         
         if not secret_details:
-            print(f"No details available for secret {secret_name}. Skipping.")
+            logger.warning(f"No details available for secret {secret_name}. Skipping.")
             return None
         
         # Find resources using this secret
@@ -429,9 +564,10 @@ def process_secret(region, secret_data, compartment_data, vault_data, config, se
             secret_name
         )
         
-        print(f"Secret {secret_name}: Found {len(resources_using_secret)} resources using this secret")
+        # Increment secret counter
+        resource_stats['vault_secrets'] += 1
         
-        # Create secret entry
+        # Create secret entry that matches the key entry format for consistency in CSV
         secret_entry = {
             "region": region,
             "compartment_id": compartment_data.id,
@@ -443,9 +579,9 @@ def process_secret(region, secret_data, compartment_data, vault_data, config, se
                 "id": secret_details.id,
                 "lifecycle_state": secret_details.lifecycle_state,
                 "time_created": secret_details.time_created.isoformat() if hasattr(secret_details.time_created, 'isoformat') else str(secret_details.time_created),
-                "current_key_version": None,
-                "algorithm": None,
-                "protection_mode": None
+                "current_key_version": "N/A",  # Secrets don't have versions like keys
+                "algorithm": "N/A",  # Secrets don't have algorithm
+                "protection_mode": secret_details.key_id is not None and "Key-protected" or "N/A"  # Check if the secret is protected by a key
             },
             "key_versions": [],
             "resources_using_key": [oci.util.to_dict(resource) for resource in resources_using_secret],
@@ -453,9 +589,10 @@ def process_secret(region, secret_data, compartment_data, vault_data, config, se
             "entity_type": "VaultSecret"
         }
         
+        logger.info(f"Completed processing secret: {secret_name}")
         return secret_entry
     except Exception as e:
-        print(f"Error processing secret {secret_data.display_name if hasattr(secret_data, 'display_name') else secret_id}: {e}")
+        logger.error(f"Error processing secret {secret_data.display_name if hasattr(secret_data, 'display_name') else 'Unknown'}: {e}")
         return None
 
 def generate_csv_report(results, output_file):
@@ -521,18 +658,24 @@ def generate_csv_report(results, output_file):
                     
                     writer.writerow(key_info + [resource_type, resource_name, resource_id, resource_state])
     
-    print(f"CSV report generated: {output_file}")
+    logger.info(f"CSV report generated: {output_file}")
 
 def process_region(region, config, compartment_id, max_workers, quiet):
     """Process a single region and return results"""
+    global resource_stats
     # Copy config and update the region
     region_config = config.copy()
     region_config["region"] = region
     
     # Setup logging based on quiet mode
+    if quiet:
+        logger.setLevel(logging.WARNING)
+    else:
+        logger.setLevel(logging.INFO)
+    
     def log_message(msg):
         if not quiet:
-            print(f"[{region}] {msg}")
+            logger.info(f"[{region}] {msg}")
     
     # Initialize OCI clients for this region
     try:
@@ -541,9 +684,10 @@ def process_region(region, config, compartment_id, max_workers, quiet):
         
         # Test the connection
         identity_client.list_regions()
+        log_message("Successfully connected to region")
     except Exception as e:
-        print(f"[{region}] Error initializing OCI clients: {e}")
-        print(f"[{region}] Skipping region.")
+        logger.error(f"[{region}] Error initializing OCI clients: {e}")
+        logger.error(f"[{region}] Skipping region.")
         return []
     
     # Get all compartments
@@ -617,7 +761,7 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                                 if key_entry:
                                     results.append(key_entry)
                             except Exception as e:
-                                print(f"    Error processing key {key_id}: {e}")
+                                logger.error(f"    Error processing key {key_id}: {str(e)}")
                 else:
                     log_message(f"    No encryption keys found in vault {vault.display_name}")
             else:
@@ -625,12 +769,54 @@ def process_region(region, config, compartment_id, max_workers, quiet):
             
             # Process secrets in this vault
             try:
+                # Try both direct method and search method to find secrets
                 secrets = get_vault_secrets(
                     region_config,
                     compartment.id,
                     vault.id,
                     vault.display_name
                 )
+                
+                # Try a second method to find secrets if none were found with the first method
+                if not secrets:
+                    try:
+                        log_message(f"    Trying alternate method to find secrets in vault {vault.display_name}")
+                        
+                        # Use the search client as a backup method
+                        search_text = f"""
+                            query VaultSecret resources
+                            where (vaultId = '{vault.id}')
+                        """
+                        
+                        search_response = search_client.search_resources(
+                            oci.resource_search.models.StructuredSearchDetails(
+                                query=search_text,
+                                matching_context_type=oci.resource_search.models.SearchDetails.MATCHING_CONTEXT_TYPE_HIGHLIGHTS,
+                                limit=1000
+                            )
+                        )
+                        
+                        # Convert search results to a format compatible with our processing
+                        if search_response.data.items:
+                            log_message(f"    Found {len(search_response.data.items)} secrets via search in vault {vault.display_name}")
+                            
+                            # We need to create secret-like objects from the search results
+                            from types import SimpleNamespace
+                            search_secrets = []
+                            
+                            for item in search_response.data.items:
+                                # Create a simple object with id and display_name attributes
+                                secret_obj = SimpleNamespace(
+                                    id=item.identifier,
+                                    display_name=item.display_name if hasattr(item, 'display_name') else "Unknown Secret",
+                                    compartment_id=item.compartment_id,
+                                    lifecycle_state=item.lifecycle_state if hasattr(item, 'lifecycle_state') else "UNKNOWN"
+                                )
+                                search_secrets.append(secret_obj)
+                            
+                            secrets = search_secrets
+                    except Exception as search_e:
+                        logger.warning(f"    Error using search method for secrets: {str(search_e)}")
                 
                 if secrets:
                     log_message(f"    Found {len(secrets)} secrets in vault {vault.display_name}")
@@ -646,7 +832,7 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                                 vault,
                                 region_config,
                                 search_client
-                            ): secret.id for secret in secrets
+                            ): getattr(secret, 'id', f"unknown-{id(secret)}") for secret in secrets
                         }
                         
                         for future in as_completed(futures):
@@ -656,11 +842,19 @@ def process_region(region, config, compartment_id, max_workers, quiet):
                                 if secret_entry:
                                     results.append(secret_entry)
                             except Exception as e:
-                                print(f"    Error processing secret {secret_id}: {e}")
+                                logger.error(f"    Error processing secret {secret_id}: {str(e)}")
                 else:
                     log_message(f"    No secrets found in vault {vault.display_name}")
             except Exception as e:
-                log_message(f"    Error processing secrets in vault {vault.display_name}: {e}")
+                logger.error(f"    Error processing secrets in vault {vault.display_name}: {str(e)}")
+    
+    # Report region statistics
+    log_message(f"Region processing complete:")
+    log_message(f"  - Found {sum(1 for r in results if r.get('entity_type') == 'Encryption Key')} encryption keys")
+    log_message(f"  - Found {sum(1 for r in results if r.get('entity_type') == 'VaultSecret')} vault secrets")
+    
+    resource_count = sum(len(r.get('resources_using_key', [])) for r in results)
+    log_message(f"  - Found {resource_count} resources using encryption keys/secrets")
     
     return results
 
@@ -674,12 +868,30 @@ def main():
     parser.add_argument('--output-file', help='Output CSV file path (default: auto-generated with date suffix)')
     parser.add_argument('--max-workers', type=int, default=5, help='Maximum number of worker threads')
     parser.add_argument('--quiet', action='store_true', help='Minimize output messages')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     args = parser.parse_args()
+    
+    # Configure logging level
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    elif args.quiet:
+        logger.setLevel(logging.WARNING)
+    else:
+        logger.setLevel(logging.INFO)
     
     # Setup logging based on quiet mode
     def log_message(msg):
         if not args.quiet:
-            print(msg)
+            logger.info(msg)
+    
+    # Reset the global resource stats
+    global resource_stats
+    resource_stats = {
+        'encryption_keys': 0,
+        'vault_secrets': 0,
+        'resources_using_keys': 0,
+        'resources_using_secrets': 0
+    }
     
     # Generate default output filename with date suffix if not specified
     if not args.output_file:
@@ -711,8 +923,8 @@ def main():
     try:
         config = oci.config.from_file(config_file, args.profile)
     except Exception as e:
-        print(f"Error loading OCI configuration: {e}")
-        print("Please check your OCI configuration and permissions.")
+        logger.error(f"Error loading OCI configuration: {e}")
+        logger.error("Please check your OCI configuration and permissions.")
         sys.exit(1)
     
     # Get tenancy ID from config
@@ -735,7 +947,7 @@ def main():
         
         compartment_id = find_compartment_by_name(identity_client, tenancy_id, compartment_name)
         if not compartment_id:
-            print("Error: Could not find compartment by name. Please check the name or use compartment ID instead.")
+            logger.error("Error: Could not find compartment by name. Please check the name or use compartment ID instead.")
             sys.exit(1)
         log_message(f"Found compartment: {compartment_name} (ID: {compartment_id})")
     else:
@@ -762,7 +974,7 @@ def main():
         )
         
         region_time = time.time() - region_start_time
-        log_message(f"Completed region {region}: Found {len(region_results)} keys in {region_time:.1f} seconds")
+        log_message(f"Completed region {region}: Found {len(region_results)} keys/secrets in {region_time:.1f} seconds")
         
         combined_results.extend(region_results)
     
@@ -770,12 +982,36 @@ def main():
     log_message(f"\nGenerating CSV report with combined results...")
     generate_csv_report(combined_results, output_file)
     
+    # Count entity types in results
+    encryption_keys_count = sum(1 for r in combined_results if r.get('entity_type') == 'Encryption Key')
+    vault_secrets_count = sum(1 for r in combined_results if r.get('entity_type') == 'VaultSecret')
+    
+    # Count resources using keys/secrets
+    resources_count = sum(len(r.get('resources_using_key', [])) for r in combined_results)
+    
     # Summary
     total_time = time.time() - start_time
     print(f"\nSummary:")
-    print(f"  Successfully processed {len(combined_results)} encryption keys/secrets across {len(regions_to_scan)} regions")
+    print(f"  Successfully processed {len(combined_results)} encryption-related items across {len(regions_to_scan)} regions")
+    print(f"    - {encryption_keys_count} encryption keys")
+    print(f"    - {vault_secrets_count} vault secrets")
+    print(f"  Found {resources_count} resources using these encryption items")
     print(f"  Total execution time: {total_time:.1f} seconds")
     print(f"  CSV report: {output_file}")
+    
+    # Provide additional guidance
+    if vault_secrets_count == 0:
+        print("\nNote: No VaultSecret resources were found. This could be due to:")
+        print("  - No secrets exist in the scanned compartments")
+        print("  - The user running this script doesn't have permission to view secrets")
+        print("  - The OCI Vault Secrets service isn't being used in this tenancy")
+    
+    if resources_count == 0:
+        print("\nNote: No resources were found using any encryption keys or secrets. This could be due to:")
+        print("  - The resources are in compartments not being scanned")
+        print("  - The search query needs to be expanded for your specific environment")
+        print("  - Resources might be using encryption but not properly tagged or linked")
+    
     print("Done!")
 
 if __name__ == "__main__":
