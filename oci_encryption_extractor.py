@@ -455,8 +455,8 @@ def main():
     parser.add_argument('--compartment-id', help='Compartment OCID to scan (defaults to tenancy)')
     parser.add_argument('--config', default='~/.oci/config', help='OCI config file')
     parser.add_argument('--profile', default='DEFAULT', help='OCI config profile')
-    parser.add_argument('--output', default='oci_keys.json', help='Output file path for JSON')
-    parser.add_argument('--csv-output', help='Output file path for CSV (default: no CSV output)')
+    parser.add_argument('--output', default='oci_keys.csv', help='Output CSV file path')
+    parser.add_argument('--json-output', help='Optional JSON output file path')
     parser.add_argument('--include-children', action='store_true', help='Scan child compartments')
     parser.add_argument('--no-versions', action='store_true', help='Skip key version details')
     parser.add_argument('--no-usage', action='store_true', help='Skip key usage details')
@@ -491,17 +491,17 @@ def main():
         include_child_compartments=args.include_children,
     )
     
-    # Save results to JSON file
-    try:
-        with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        print(f"\nJSON results saved to {args.output}")
-    except Exception as e:
-        print(f"Error saving JSON results: {e}")
+    # Export to CSV (default)
+    export_to_csv(results, args.output)
     
-    # Export to CSV if requested
-    if args.csv_output:
-        export_to_csv(results, args.csv_output)
+    # Save results to JSON file if requested
+    if args.json_output:
+        try:
+            with open(args.json_output, 'w') as f:
+                json.dump(results, f, indent=2, default=str)
+            print(f"\nJSON results saved to {args.json_output}")
+        except Exception as e:
+            print(f"Error saving JSON results: {e}")
     
     end_time = time.time()
     print(f"Completed in {end_time - start_time:.2f} seconds")
