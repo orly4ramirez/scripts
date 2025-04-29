@@ -13,6 +13,9 @@ group_users_output_file = "oci_group_users.csv"
 # Data structure for all policy statements
 policy_statements = []
 
+# Cache for all groups to avoid multiple lookups
+all_groups_cache = None
+
 def get_config_details():
     """Retrieve tenancy OCID and regions from OCI config file."""
     config_file = os.path.expanduser("~/.oci/config")
@@ -22,35 +25,74 @@ def get_config_details():
         exit(1)
 
     config = configparser.ConfigParser()
-    config.read(config_file)
+    try:
+        config.read(config_file)
+    except configparser.Error as e:
+        print(f"ERROR: Failed to parse OCI config file {config_file}: {e}")
+        exit(1)
 
     # Determine default profile for tenancy OCID lookup
-    default_profile = 'DEFAULT' # Standard default
-    # You might want to make this configurable if needed
+    default_profile = 'DEFAULT'
 
     if default_profile not in config:
         print(f"ERROR: No [{default_profile}] profile found in {config_file} to determine tenancy OCID.")
+        # Check if it exists with different casing (less likely but possible)
+        if default_profile.lower() in (k.lower() for k in config.sections()):
+             print(f"       Hint: A profile with different casing like '[{next(k for k in config.sections() if k.lower() == default_profile.lower())}]' exists.")
         exit(1)
 
     tenancy_ocid = config[default_profile].get('tenancy')
     if not tenancy_ocid:
-        print(f"ERROR: No tenancy OCID found in [{default_profile}] profile of {config_file}.")
+        print(f"ERROR: No 'tenancy' key found in [{default_profile}] profile of {config_file}.")
         exit(1)
-    print(f"Found Tenancy OCID in [{default_profile}] profile.") # Don't print the OCID itself
+    print(f"Found Tenancy OCID using profile: [{default_profile}]") # Don't print the OCID itself
+
+    # --- Debugging Region Detection --- START ---
+    print(f"\nDebugging region detection in profile [{default_profile}]...")
+    if default_profile in config:
+        if 'region' in config[default_profile]:
+             print(f"  Found 'region' key in [{default_profile}]: '{config[default_profile]['region']}'")
+        elif ' Region' in config[default_profile]: # Check for common typo (space)
+             print(f"  WARNING: Found key ' Region' (with leading space) instead of 'region' in [{default_profile}]. Using it: '{config[default_profile][' Region']}'")
+             config[default_profile]['region'] = config[default_profile][' Region'] # Correct it for parsing
+        elif 'Region' in config[default_profile]: # Check for common typo (capital R)
+             print(f"  WARNING: Found key 'Region' (capital R) instead of 'region' in [{default_profile}]. Using it: '{config[default_profile]['Region']}'")
+             config[default_profile]['region'] = config[default_profile]['Region'] # Correct it for parsing
+        else:
+             print(f"  Could not find 'region' key in [{default_profile}].")
+    else:
+        # This case was handled above, but added for completeness
+        print(f"  Profile [{default_profile}] section itself was not found.")
+    print("--- Debugging End ---\n")
+    # --- Debugging Region Detection --- END ---
 
     # Get all unique regions from ALL profiles in the config file
     regions = set()
     print("Scanning config file for regions in all profiles...")
     for section in config.sections():
+        # Skip the DEFAULT section handled separately if needed, or check if it has region
+        # if section == default_profile:
+        #     continue
         if 'region' in config[section]:
             region_name = config[section]['region']
-            print(f"  Found region '{region_name}' in profile [{section}]")
-            regions.add(region_name)
+            # Check for empty region string
+            if region_name and region_name.strip():
+                print(f"  Found region '{region_name.strip()}' in profile [{section}]")
+                regions.add(region_name.strip())
+            else:
+                print(f"  WARNING: Found empty 'region' key in profile [{section}]. Skipping.")
         # else:
-            # print(f"  Profile [{section}] does not contain a 'region' key.")
+             # print(f"  Profile [{section}] does not contain a 'region' key.")
+
+    # Explicitly add region from DEFAULT profile if found during debug
+    if default_profile in config and 'region' in config[default_profile]:
+        default_region = config[default_profile]['region'].strip()
+        if default_region and default_region not in regions:
+            print(f"  Adding region '{default_region}' from [{default_profile}] profile.")
+            regions.add(default_region)
 
     if not regions:
-        print("ERROR: No regions found in any profile within the OCI config file. Please add at least one region.")
+        print("ERROR: No valid regions found in any profile within the OCI config file. Please add at least one region key with a value.")
         exit(1)
 
     print(f"Successfully identified {len(regions)} unique region(s) for processing.")
@@ -250,31 +292,59 @@ def write_policies_to_csv():
 # --- Functions for Group User Extraction ---
 
 def get_group_ocid_by_name(group_name):
-    """Attempts to find the OCID of a group by its name (case-insensitive)."""
-    print(f"    Attempting to find OCID for group name: '{group_name}' (case-insensitive search)")
-    # Command to list groups by name (exact match, but we'll handle case below)
-    # The OCI CLI --name filter might be case-sensitive, so we list all and filter locally for robust case-insensitivity.
-    # Alternatively, try exact match first, then list all if no match.
-    # Let's try the direct `--name` filter first for efficiency.
-    group_cmd = f"oci iam group list --name \"{group_name}\" --all" # Use quotes for names with spaces
-    groups_data = run_oci_command(group_cmd)
+    """Attempts to find the OCID of a group by its name (case-insensitive), with fallback."""
+    global all_groups_cache # Use the global cache
+    print(f"    Attempting to find OCID for group name: '{group_name}' (case-insensitive)")
+
+    # 1. Try direct name filter first (more efficient)
+    print(f"      Attempt 1: Using OCI CLI --name filter...")
+    # Use quotes for names with spaces/special chars. Escape potential internal quotes?
+    # Simple quoting should work for most names if the shell handles it.
+    quoted_group_name = f'"{group_name}"' # Simple quoting
+    group_cmd = f"oci iam group list --name {quoted_group_name} --all"
+    groups_data_filtered = run_oci_command(group_cmd)
 
     found_ocid = None
-    if groups_data and "data" in groups_data:
-        for group in groups_data["data"]:
-            # Double check name case-insensitively
+    if groups_data_filtered and "data" in groups_data_filtered:
+        for group in groups_data_filtered["data"]:
+            # Double check name case-insensitively as filter might be sensitive
             if group.get("name", "").lower() == group_name.lower():
                 found_ocid = group.get("id")
-                print(f"      Found matching group OCID: {found_ocid}")
-                break # Found the exact match (case-insensitive)
+                print(f"      Found matching group OCID via --name filter: {found_ocid[:15]}...")
+                return found_ocid # Success!
+        # If data was returned but no exact case-insensitive match, the filter might be imperfect
+        print(f"      Direct --name filter returned data, but no exact case-insensitive match for '{group_name}'. Proceeding to fallback.")
+    elif groups_data_filtered is None:
+        # Command failed (error logged by run_oci_command), proceed to fallback
+         print(f"      Direct --name filter command failed. Proceeding to fallback.")
+    # else: # Command succeeded but returned empty data list
+    #     print(f"      Direct --name filter found no groups named '{group_name}'. Proceeding to fallback.")
 
-    # If direct name filter didn't work (maybe due to case sensitivity on server-side filter)
-    # As a fallback, list all groups (costly!) and filter. Let's skip this for now to avoid performance hit.
-    # Consider adding the fallback if the --name filter proves unreliable for case.
-    if not found_ocid:
-         print(f"      WARNING: Could not find an OCID for group name '{group_name}' using direct name filter.")
+    # 2. Fallback: List all groups (if not already cached) and filter locally
+    print(f"      Attempt 2: Using fallback - listing all groups (if not cached)...")
+    if all_groups_cache is None:
+        print("        Fetching all groups for the first time (this might take a moment)...")
+        all_groups_cmd = "oci iam group list --all"
+        all_groups_data = run_oci_command(all_groups_cmd)
+        if all_groups_data and "data" in all_groups_data:
+            print(f"        Successfully fetched {len(all_groups_data['data'])} groups. Caching.")
+            # Create a lowercase name to group data map for efficient lookup
+            all_groups_cache = {g.get("name", "").lower(): g for g in all_groups_data["data"]}
+        else:
+            print("        ERROR: Failed to fetch the list of all groups for fallback lookup. Cannot find group OCID.")
+            all_groups_cache = {} # Set empty cache to prevent retrying
+            return None
 
-    return found_ocid
+    # Search in the cached data (case-insensitive)
+    group_data = all_groups_cache.get(group_name.lower())
+    if group_data:
+        found_ocid = group_data.get("id")
+        group_status = group_data.get("lifecycle-state", "UNKNOWN")
+        print(f"      Found matching group OCID via fallback search: {found_ocid[:15]}... (Status: {group_status})")
+        return found_ocid
+    else:
+        print(f"      WARNING: Could not find group '{group_name}' via fallback search either.")
+        return None
 
 def get_users_in_group(group_ocid, group_name_for_log):
     """Retrieves active users belonging to a specific group OCID."""
@@ -361,6 +431,10 @@ def main():
     """Main function: Extracts OCI policies, then extracts users from groups found in policies."""
     print("OCI Policy & Group User Extractor")
     print("=================================")
+
+    # Reset global cache at the start of each run
+    global all_groups_cache
+    all_groups_cache = None
 
     # Get tenancy OCID and regions from config
     tenancy_ocid, regions = get_config_details()
